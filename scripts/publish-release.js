@@ -18,8 +18,19 @@ const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const conf = JSON.parse(
   fs.readFileSync(path.join(root, "src-tauri", "tauri.conf.json"), "utf8"),
 );
-const version = conf.version;
-const repo = process.argv[2] || "OutpostCoding/Outpost";
+function getOriginRepo() {
+  try {
+    const url = execSync("git remote get-url origin", { encoding: "utf8" }).trim();
+    const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)(?:\.git)?$/);
+    if (match) return `${match[1]}/${match[2]}`;
+  } catch {}
+  return "OutpostCoding/Outpost";
+}
+
+const repo = process.argv[2] || getOriginRepo();
+const isPrivate = Boolean(
+  process.env.PRIVATE_REPO || repo.endsWith("-Dev") || repo.endsWith("-Private"),
+);
 const token = process.env.GITHUB_TOKEN;
 
 if (!token) {
@@ -168,7 +179,7 @@ await uploadAsset(path.join(msiDir, msi + ".sig"), msi + ".sig", "text/plain");
 console.log(`\n📝 Generating update manifest (latest.json)...`);
 // For public releases, use the direct GitHub releases download URL (no tokens or rate limits needed).
 // If PRIVATE_REPO=1 is set, fall back to the authenticated release assets API URL.
-const downloadUrl = process.env.PRIVATE_REPO
+const downloadUrl = isPrivate
   ? `https://api.github.com/repos/${repo}/releases/assets/${uploadedExe.id}`
   : `https://github.com/${repo}/releases/download/v${version}/${exe}`;
 const manifest = {

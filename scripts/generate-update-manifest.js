@@ -32,13 +32,24 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execSync } from "node:child_process";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const conf = JSON.parse(
   fs.readFileSync(path.join(root, "src-tauri", "tauri.conf.json"), "utf8"),
 );
 const version = conf.version;
-const repo = process.argv[2] || "OutpostCoding/Outpost";
+
+function getOriginRepo() {
+  try {
+    const url = execSync("git remote get-url origin", { encoding: "utf8" }).trim();
+    const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)(?:\.git)?$/);
+    if (match) return `${match[1]}/${match[2]}`;
+  } catch {}
+  return "OutpostCoding/Outpost";
+}
+
+const repo = process.argv[2] || getOriginRepo();
 const token = process.env.GITHUB_TOKEN;
 
 const nsisDir = path.join(root, "src-tauri", "target", "release", "bundle", "nsis");

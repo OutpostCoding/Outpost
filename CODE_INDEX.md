@@ -5,7 +5,8 @@ listings, no line numbers** — all of that is computed fresh (`project_info` ma
 `code_search`, line-1 file banners), so it can never go stale.
 
 Companion docs: `README.md` (overview + user guide), `src/CONNECTIONS.md` (providers).
-Note: there is no ENV_NOTES file — the environment notes are a Rust const (`ENV_NOTES`) in
+(Archived design notes, changelogs, and historical refactor notes live in `archive/`). Note:
+there is no ENV_NOTES file — the environment notes are a Rust const (`ENV_NOTES`) in
 `src-tauri/src/commands.rs`, injected into every session's system prompt.
 
 ## Invariants & gotchas
