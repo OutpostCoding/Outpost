@@ -18,6 +18,7 @@ const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const conf = JSON.parse(
   fs.readFileSync(path.join(root, "src-tauri", "tauri.conf.json"), "utf8"),
 );
+const version = conf.version;
 function getOriginRepo() {
   try {
     const url = execSync("git remote get-url origin", { encoding: "utf8" }).trim();
