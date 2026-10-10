@@ -1,0 +1,10 @@
+# Keep text files on LF endings in both the repo and the working tree.
+# The index already stores LF (core.autocrlf=true was normalizing on commit),
+# but the Windows default checked files out as CRLF, which made exact-string
+# edits and diffs inconsistent. This pins the working tree to LF too.
+* text=auto eol=lf
+
+# Windows cmd.exe requires CRLF line endings for batch files to execute properly.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+

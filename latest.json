@@ -1,0 +1,11 @@
+{
+  "version": "0.4.0",
+  "notes": "Outpost 0.4.0",
+  "pub_date": "2026-10-07T14:26:23Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTSmh6NGNhVHdBMVBHVlRRNVJiWTBQTk9PS21RS0wwQnJnZXp5VU0rWnR5WUhFenRsS2xnc0t5OTFpYlZIeFdYWDhtRldvSElWNkRDQ25BSjZHSFh3bXU5eG5OMlhaZVE4PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkxMzgzMTgzCWZpbGU6T3V0cG9zdF8wLjQuMF94NjQtc2V0dXAuZXhlClEwVlA0TW0yWEIzRHkvcTVPMDNQZnhoaEtWOHlhbEpKWTZXa2xMK1dRMUtWdm53QTBZaUJnSDZkR1ZOQk50VHNuZWp0TFNNREJzUzI2K1pzN1Irc0R3PT0K",
+      "url": "https://github.com/OutpostCoding/Outpost/releases/download/v0.4.0/Outpost_0.4.0_x64-setup.exe"
+    }
+  }
+}

@@ -1,0 +1,6 @@
+# expect: context_exceeded
+# source: LM Studio local server predict stream, captured Oct 2026, turn 3 of a tool-calling session (Ling-3.0-Tiny)
+# notes: Exact HTTP 400 body from the debugging session that motivated the classifier. The
+#   "predict stream" wrapper previously misrouted this into the diff-parser salvage +
+#   non-streaming retry pipeline, burying the real message under a second, bare HTTP 400.
+{"error":"Engine protocol predict stream returned an error: {\"code\":500,\"message\":\"Context size has been exceeded.\",\"type\":\"server_error\"}"}

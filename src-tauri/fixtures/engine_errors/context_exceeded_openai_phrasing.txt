@@ -1,0 +1,5 @@
+# expect: context_exceeded
+# source: standard OpenAI-compatible phrasing (llama.cpp /v1, vLLM, OpenAI) — not captured locally yet
+# notes: Representative phrasing retained so the classifier holds when it does arrive;
+#   covers "maximum context length" regardless of the numbers each server fills in.
+This model's maximum context length is 8192 tokens. However, you requested 9200 tokens (8200 in the messages, 1000 in the completion).

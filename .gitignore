@@ -1,0 +1,43 @@
+# Outpost — root ignore rules (single-root layout since the 0.2.9 restructure:
+# the frontend/ subtree was flattened into this directory; the rules from the
+# old frontend/.gitignore are merged in below; src-tauri/.gitignore handles
+# target/ and the app-level build bits).
+
+# Installers — build artifacts don't belong in history
+releases/
+
+# Local editor / agent config (machine-specific)
+.claude/
+archive/
+NOTES.md
+
+# --- merged from the former frontend/.gitignore ---
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS junk
+Thumbs.db
+Desktop.ini

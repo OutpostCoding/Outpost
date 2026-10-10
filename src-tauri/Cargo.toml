@@ -1,0 +1,108 @@
+[package]
+name = "outpost"
+version = "0.4.0"
+description = "A fast, local-first AI development harness engineered for Windows"
+authors = ["OutpostCoding"]
+license = "GPL-3.0-or-later"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "frontend_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Debug builds default to FULL debug info (`debug = 2`), and across this dependency
+# tree â€” `windows`, `tauri`, bundled `rusqlite`, `pdf-extract` â€” that is where the
+# bulk of `target/` comes from: `frontend_lib.lib` alone reached 970 MB, and the
+# folder as a whole reached 53 GB (2026-07-26). `line-tables-only` keeps file and
+# line numbers in backtraces and drops the variable-inspection data, which costs
+# nothing here â€” this codebase is debugged with `eprintln!` and tests, not a
+# stepping debugger.
+#
+# NB `target/` is never garbage-collected by cargo: artifacts for dependency
+# versions and feature sets that no longer exist stay forever. Deleting
+# `target/debug/incremental` is always safe (pure cache); deleting `target/debug`
+# costs one full rebuild and nothing else. Nothing in `target/` is source.
+[profile.dev]
+debug = "line-tables-only"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-updater = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Provider plumbing (spec Â§2): HTTP + streaming to the inference backend.
+reqwest = { version = "0.12", features = ["json", "stream"] }
+async-trait = "0.1"
+futures-util = "0.3"
+async-stream = "0.3"
+anyhow = "1"
+# Non-poisoning mutex for the shared SQLite connection (see store.rs): a panic
+# while a lock is held must not poison every later lock â€” std::sync::Mutex would.
+parking_lot = "0.12"
+dotenvy = "0.15"
+similar = "2"
+tokio = { version = "1", features = ["sync", "macros", "rt", "process", "time", "io-util"] }
+tokio-util = "0.7"
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = "0.4"
+chrono-tz = "0.10"
+# Secure API-key storage in the OS credential store (Windows Credential Manager).
+# Add apple-native / sync-secret-service features when building for macOS/Linux.
+keyring = { version = "3", features = ["windows-native"] }
+# Document reading (upload â†’ markdown): unzip a .docx + parse its XML, and pull
+# the text layer out of PDFs. Generation (markdown â†’ .docx) will add docx-rs.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.36"
+pdf-extract = "0.7"
+# Coding-harness search: optional regex mode + glob file-filtering for project_search.
+regex = "1"
+glob = "0.3"
+# Encoding image files as base64 data URIs for the vision path (project_read_image).
+base64 = "0.22"
+# Local text embeddings (hybrid code search, spec Â§9): bge-small-en-v1.5 runs
+# in-process via ONNX Runtime â€” no subprocess, no network after the first model
+# download. `image-models` (a default feature) is disabled: we only need text,
+# and it would drag in the whole `image` codec stack. native-tls keeps us on
+# Windows schannel rather than rustls/aws-lc-rs (which needs CMake + a C build).
+fastembed = { version = "6", default-features = false, features = [
+    "hf-hub-native-tls",
+    "ort-download-binaries-native-tls",
+] }
+iana-time-zone = "0.1.65"
+windows = { version = "0.61", features = ["Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security"] }
+sysinfo = "0.39.6"
+
+# Tree-sitter concrete syntax tree parsing for code_symbols and AST analysis
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-gdscript = "6.1"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-c-sharp = "=0.23.1"
+
+# Visual perception (src/capture.rs): WebView2 CapturePreview has no Tauri wrapper,
+# so we call it via COM. These MUST stay pinned to the exact versions Tauri resolves
+# (2.11.3 â†’ webview2-com 0.38.2 â†’ windows 0.61.3) or the COM types don't unify and
+# this stops compiling. Both are already in the tree via Tauri â€” no new downloads.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+
+
+

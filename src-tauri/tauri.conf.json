@@ -1,0 +1,49 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Outpost",
+  "version": "0.4.0",
+  "identifier": "com.outpost.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Outpost",
+        "width": 1280,
+        "height": 860,
+        "center": true,
+        "maximized": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost ws://localhost:1420; img-src 'self' data: blob: asset: http://asset.localhost https://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self' data:; script-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; form-action 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": true,
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ0MDAzQzY5MUMzRTg3ODkKUldTSmh6NGNhVHdBMUdPN1pVRkhHQ3FlNjlQMW9Wck01V29FbWNuYU8rT2dvWGhhM1FhNjY4VHcK",
+      "endpoints": [
+        "https://github.com/OutpostCoding/Outpost/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

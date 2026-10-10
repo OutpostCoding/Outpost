@@ -1,0 +1,6 @@
+# expect: diff_parser
+# source: LM Studio predict stream, captured Sep-Oct 2026 (DPS-repo session, Ling-3.0-Tiny / Qwen)
+# notes: Model attempted two tool calls; the parsed call count dropped 2 -> 1 across
+#   tokens and llama.cpp aborted with "Invalid diff". The payload carries the completed
+#   calls under `Previous (2):` — the input for salvage_tools_from_diff_error.
+{"error":"Engine protocol predict stream returned an error: {\"code\":500,\"message\":\"Invalid diff: now finding less tool calls!\n  Previous (2):\n    - name: 'read_file', args: '{\"path\":\"pyproject.toml\"}'\n    - name: 'code_search', args: '{'\n  Current (1):\n    - name: 'read_file', args: '{\"path\":\"pyproject.toml\"}'\n  Current msg text content:\nLet me now look at the project's dependency file and any other security-relevant areas I haven't yet examined.\n<tool_call>code_search\n<arg_key>glob\n\",\"type\":\"server_error\"}"}"

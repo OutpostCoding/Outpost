@@ -1,0 +1,6 @@
+# expect: diff_parser
+# source: LM Studio predict stream, captured Oct 2026 — trailing token after tool call 0's closing brace (Spark X2.5-4b)
+# notes: LM Studio finalizes tool call 0 the instant its JSON arguments close; any
+#   trailing token (extra `}`, newline, `</think>`) becomes an illegal delta on a finalized
+#   call and aborts the stream. Outpost recovers via tools_acc + extract_valid_json_args.
+Engine protocol predict stream returned a tool call delta for already finalized tool call 0.

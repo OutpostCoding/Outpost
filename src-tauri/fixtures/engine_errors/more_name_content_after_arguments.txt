@@ -1,0 +1,5 @@
+# expect: diff_parser
+# source: llama.cpp common_chat_msg_diff signature (LM Studio engine), observed as engine-protocol error text
+# notes: Third known face of the diff-parser family — the tool-call name grew after
+#   argument tokens had already begun.
+Engine protocol tool call 0 returned more name content after arguments started.

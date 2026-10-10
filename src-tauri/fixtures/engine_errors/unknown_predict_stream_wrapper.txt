@@ -1,0 +1,7 @@
+# expect: other
+# source: synthetic — regression guard, not a capture
+# notes: The wrapper "Engine protocol predict stream returned an error: {…}" appears on
+#   EVERY engine failure. An unknown inner message must classify Other (no salvage, no
+#   non-streaming retry). The pre-classifier bug matched the wrapper itself and treated
+#   every engine error as a diff-parser crash; this fixture pins that out.
+{"error":"Engine protocol predict stream returned an error: {\"code\":500,\"message\":\"a new and unrecognized engine failure\",\"type\":\"server_error\"}"}
