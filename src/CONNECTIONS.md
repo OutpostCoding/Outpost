@@ -30,7 +30,7 @@ Each entry looks like this:
 | `baseUrl` | The API root URL. Also editable per-connection from inside the menu. |
 | `needsKey` | `true` if the provider needs an API key; `false` for a local server (LM Studio). |
 | `ready` | `true` = selectable in the menu. (`false` greys it out — only used to stage something unfinished.) |
-| `midSystemMessages` | OBSOLETE (2026-08-30) — no longer consulted: the per-turn tail folds into the one leading system block on every adapter (CODE_INDEX.md → Invariants & gotchas → Head/tail discipline). Kept only for contract compatibility with saved connections; ignore it. |
+| `midSystemMessages` | OBSOLETE (2026-08-30) — no longer consulted: the per-turn tail folds into the one leading system block on every adapter. Kept only for contract compatibility with saved connections; ignore it. |
 
 ---
 
@@ -104,8 +104,7 @@ automatically — no manual step.
   virtually every hosted API. Adding these is the one-line change above.
 - **`"anthropic"`** → the dedicated Claude adapter (native Messages API, with
   extended thinking). Use only for Anthropic's own endpoint. The per-turn tail
-  folds into the top-level `system` string on every model (CODE_INDEX.md → Invariants
-  & gotchas → Head/tail discipline).
+  folds into the top-level `system` string on every model.
 
 If you ever need a provider that is **neither** OpenAI-compatible nor Anthropic
 (rare — most APIs speak OpenAI's format now), that requires a new adapter in Rust:
