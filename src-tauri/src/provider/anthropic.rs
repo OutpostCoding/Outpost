@@ -119,15 +119,30 @@ fn to_anthropic(messages: &[Message], require_signature: bool) -> (String, Vec<V
                 // [tool_result…, text, image], which is exactly what we want the model
                 // to see: "here are your tool results, and here is the screenshot".
                 let merged = if parts.is_empty() {
-                    false
-                } else if let Some(last) = out.last_mut() {
-                    if last.get("role").and_then(Value::as_str) == Some("user") {
-                        match last.get_mut("content").and_then(Value::as_array_mut) {
-                            Some(arr) => {
-                                arr.append(&mut parts);
-                                true
+                    out.last().and_then(|l| l.get("role")).and_then(Value::as_str) == Some("user")
+                } else if let Some(last) = out.last_mut().filter(|l| l.get("role").and_then(Value::as_str) == Some("user")) {
+                    if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
+                        arr.append(&mut parts);
+                        true
+                    } else if let Some(prev_str) = last.get("content").and_then(Value::as_str) {
+                        if m.images.is_empty() {
+                            let new_content = if prev_str.is_empty() {
+                                m.content.clone()
+                            } else if m.content.is_empty() {
+                                prev_str.to_string()
+                            } else {
+                                format!("{prev_str}\n\n{}", m.content)
+                            };
+                            last["content"] = json!(new_content);
+                            true
+                        } else {
+                            let mut arr = Vec::new();
+                            if !prev_str.is_empty() {
+                                arr.push(json!({ "type": "text", "text": prev_str }));
                             }
-                            None => false,
+                            arr.append(&mut parts);
+                            last["content"] = json!(arr);
+                            true
                         }
                     } else {
                         false
@@ -193,6 +208,22 @@ fn to_anthropic(messages: &[Message], require_signature: bool) -> (String, Vec<V
                 if blocks.is_empty() {
                     blocks.push(json!({ "type": "text", "text": "" }));
                 }
+
+                // If the previous turn is already an assistant message, merge blocks into it
+                // rather than opening a second consecutive assistant message.
+                if let Some(last) = out.last_mut().filter(|l| l.get("role").and_then(Value::as_str) == Some("assistant")) {
+                    if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
+                        for b in blocks {
+                            let is_empty_text = b.get("type").and_then(Value::as_str) == Some("text")
+                                && b.get("text").and_then(Value::as_str).map_or(false, str::is_empty);
+                            if !is_empty_text || arr.is_empty() {
+                                arr.push(b);
+                            }
+                        }
+                        continue;
+                    }
+                }
+
                 out.push(json!({ "role": "assistant", "content": blocks }));
             }
             Role::Tool => {
@@ -207,6 +238,14 @@ fn to_anthropic(messages: &[Message], require_signature: bool) -> (String, Vec<V
                     if last.get("role").and_then(Value::as_str) == Some("user") {
                         if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
                             arr.push(block);
+                            continue;
+                        } else if let Some(prev_str) = last.get("content").and_then(Value::as_str) {
+                            let mut arr = Vec::new();
+                            if !prev_str.is_empty() {
+                                arr.push(json!({ "type": "text", "text": prev_str }));
+                            }
+                            arr.push(block);
+                            last["content"] = json!(arr);
                             continue;
                         }
                     }
@@ -463,16 +502,24 @@ impl Provider for AnthropicProvider {
                     bytes.next().await
                 };
 
-                let Some(chunk) = next_chunk else { break 'outer };
-                started = true;
-                let b = match chunk {
-                    Ok(b) => b,
-                    Err(e) => {
+                let reached_eof = match next_chunk {
+                    Some(Ok(b)) => {
+                        started = true;
+                        buf.extend_from_slice(&b);
+                        false
+                    }
+                    Some(Err(e)) => {
                         yield StreamEvent::Error { message: format!("stream error: {e}") };
                         return;
                     }
+                    None => {
+                        if buf.is_empty() {
+                            break 'outer;
+                        }
+                        buf.push(b'\n');
+                        true
+                    }
                 };
-                buf.extend_from_slice(&b);
 
                 // SSE frames are newline-delimited; decode whole lines only so a
                 // multi-byte char split across chunks isn't corrupted.
@@ -480,8 +527,13 @@ impl Provider for AnthropicProvider {
                     let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
                     let line = String::from_utf8_lossy(&line_bytes);
                     let line = line.trim();
-                    let Some(data) = line.strip_prefix("data:") else { continue };
-                    let data = data.trim();
+                    let data = if let Some(d) = line.strip_prefix("data:") {
+                        d.trim()
+                    } else if line.starts_with('{') && line.contains("\"error\"") {
+                        line
+                    } else {
+                        continue;
+                    };
                     if data.is_empty() {
                         continue;
                     }
@@ -569,12 +621,29 @@ impl Provider for AnthropicProvider {
                         }
                         Some("message_stop") => break 'outer,
                         Some("error") => {
-                            let msg = v["error"]["message"].as_str().unwrap_or("stream error");
+                            let msg = v["error"]["message"]
+                                .as_str()
+                                .or_else(|| v["error"].as_str())
+                                .unwrap_or("stream error");
                             yield StreamEvent::Error { message: format!("Anthropic: {msg}") };
                             return;
                         }
-                        _ => {}
+                        _ => {
+                            if let Some(err) = v.get("error") {
+                                let msg = err
+                                    .get("message")
+                                    .and_then(|m| m.as_str())
+                                    .or_else(|| err.as_str())
+                                    .unwrap_or("stream error");
+                                yield StreamEvent::Error { message: format!("Anthropic: {msg}") };
+                                return;
+                            }
+                        }
                     }
+                }
+
+                if reached_eof {
+                    break 'outer;
                 }
             }
 
@@ -594,7 +663,7 @@ impl Provider for AnthropicProvider {
                     } else {
                         args
                     };
-                    yield StreamEvent::ToolCall(ToolCall { id, name, arguments });
+                    yield StreamEvent::ToolCall(ToolCall { id, name, arguments, extra_content: None });
                 }
             }
             yield StreamEvent::Done { finish_reason: stop_reason };
@@ -705,6 +774,7 @@ mod anthropic_shape_tests {
             id: "call_1".into(),
             name: "browser_screenshot".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }];
         let mut result = msg(Role::Tool, "screenshot captured");
         result.tool_call_id = Some("call_1".into());
@@ -732,11 +802,13 @@ mod anthropic_shape_tests {
                 id: "a".into(),
                 name: "project_read".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
             ToolCall {
                 id: "b".into(),
                 name: "browser_screenshot".into(),
                 arguments: "{}".into(),
+                extra_content: None,
             },
         ];
         let mut r1 = msg(Role::Tool, "file contents");
@@ -848,6 +920,7 @@ mod anthropic_shape_tests {
             id: "call_1".into(),
             name: "project_read".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }];
         let mut result = msg(Role::Tool, "file contents");
         result.tool_call_id = Some("call_1".into());
@@ -875,6 +948,7 @@ mod anthropic_shape_tests {
             id: "call_1".into(),
             name: "project_read".into(),
             arguments: "{}".into(),
+            extra_content: None,
         }];
 
         // When require_signature is true (official Anthropic): no signature means no thinking block (avoids 400)
@@ -994,5 +1068,41 @@ mod anthropic_shape_tests {
         assert_eq!(arr.len(), 2);
         assert!(arr[0].get("cache_control").is_none());
         assert_eq!(arr[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn to_anthropic_merges_consecutive_same_role_messages() {
+        // Consecutive user messages
+        let msgs_user = vec![
+            msg(Role::User, "first user question"),
+            msg(Role::User, "second user addendum"),
+        ];
+        let (_, out_user) = to_anthropic(&msgs_user, true);
+        assert_eq!(out_user.len(), 1, "consecutive user turns should merge into 1");
+        assert_eq!(out_user[0]["role"], "user");
+        assert_eq!(
+            out_user[0]["content"],
+            "first user question\n\nsecond user addendum"
+        );
+
+        // Consecutive assistant messages
+        let mut a1 = msg(Role::Assistant, "part 1");
+        a1.tool_calls = vec![ToolCall {
+            id: "tc1".into(),
+            name: "test_tool".into(),
+            arguments: "{}".into(),
+            extra_content: None,
+        }];
+        let a2 = msg(Role::Assistant, "part 2 answer");
+        let (_, out_asst) = to_anthropic(&[a1, a2], true);
+        assert_eq!(out_asst.len(), 1, "consecutive assistant turns should merge into 1");
+        assert_eq!(out_asst[0]["role"], "assistant");
+        let blocks = out_asst[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "part 1");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[2]["type"], "text");
+        assert_eq!(blocks[2]["text"], "part 2 answer");
     }
 }

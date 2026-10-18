@@ -161,9 +161,9 @@ pub fn coding_orientation(root: &str, auto_writes: bool) -> String {
         "You are in a coding session rooted at: {root}.\n\
          Tool Selection Contract (always prefer specialized native tools over shell commands):\n\
          - Exploration & Search: Start with `code_search` as your primary discovery tool to locate relevant logic, concepts, and features across the codebase. Reach for `grep_search` only when you already know an exact identifier, symbol, or regex and need an exhaustive list of all call sites. Never run shell search commands (grep, findstr, find).\n\
-         - Inspection: ALWAYS use `read_file` (with line ranges via `read_file_lines` when reading large files) or `find_symbols` (for structural outlines). Never use shell commands to view files (cat, type, head, tail).\n\
+         - Inspection: ALWAYS use `read_file` (pass `start` and `lines` when reading specific ranges of large files) or `find_symbols` (for structural outlines). Never use shell commands to view files (cat, type, head, tail).\n\
          - Modification: ALWAYS use `edit_file` (for targeted changes with snippet matching or symbol replacement) or `write_file` (to create or overwrite whole files). Never use shell commands or ad-hoc scripts to edit files.\n\
-         - Execution: `run_command` is strictly reserved for executing test suites, build tools, package managers, and launching services (e.g. `cargo check`, `npm test`, `python main.py`).\n\
+         - Execution & Git: `run_command` is reserved for executing test suites, build tools, package managers, git commands, and launching services (e.g. `cargo check`, `npm test`, `python main.py`). Read-only git inspection (`git status`, `git log`, `git diff`, `git show`, `git blame`) is auto-approved without prompting. Before running `git commit`, inspect staged changes with `git diff --staged` or `git status` (or `get_diff`) to verify your modifications.\n\
          Working memory: tool results from earlier turns are archived into compact receipts (`receipt — read_file(...) returned...`) to conserve context. This is standard harness operation, not a tool failure. Re-read files or inspect symbols at any time as needed.\n\
          File safety: Outpost automatically snapshots files before editing or deleting. Use `get_diff` to inspect diffs and `restore_file` to undo changes when needed."
     );

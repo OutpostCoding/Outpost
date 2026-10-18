@@ -1,6 +1,6 @@
 [package]
 name = "outpost"
-version = "0.4.0"
+version = "0.4.1"
 description = "A fast, local-first AI development harness engineered for Windows"
 authors = ["OutpostCoding"]
 license = "GPL-3.0-or-later"
@@ -40,7 +40,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 # Provider plumbing (spec Â§2): HTTP + streaming to the inference backend.
 reqwest = { version = "0.12", features = ["json", "stream"] }
 async-trait = "0.1"

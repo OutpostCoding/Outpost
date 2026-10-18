@@ -12,6 +12,7 @@ import { useCompactionManager } from "./hooks/useCompactionManager";
 
 import { ExportModal } from "./modals/ExportModal";
 import { AppContext, type ExternalFileAttachment } from "./AppContext";
+import { check, type Update } from "@tauri-apps/plugin-updater";
 import { SettingsModal } from "./modals/SettingsModal";
 import { InstructionsModal } from "./modals/InstructionsModal";
 import { ContextInspectorModal } from "./modals/ContextInspectorModal";
@@ -56,7 +57,7 @@ import {
   stopRepoIndexing,
   type IndexProgress,
 } from "./lib/provider";
-import { runPython, preloadPython } from "./lib/python";
+import { runPython, preloadPython, cancelPython } from "./lib/python";
 import "./App.css";
 // KaTeX stylesheet + fonts. `katex` bundles its own web fonts, which Vite emits
 // as local assets — so math renders fully offline, no CDN (keeps the no-supply-
@@ -133,8 +134,6 @@ function App() {
     setMaxContext,
     maxToolCalls,
     setMaxToolCalls,
-    sequentialToolCalls,
-    setSequentialToolCalls,
     mdWriteOn,
     setMdWriteOn,
     notesOn,
@@ -225,6 +224,7 @@ function App() {
     prefs0.conn_base_urls ?? {},
   );
   const [showSettings, setShowSettings] = useState(false);
+  const [availableUpdate, setAvailableUpdate] = useState<Update | null>(null);
   // Which page of the settings modal is showing. Settings is a modal overlay
   // (opened from the sidebar user button); the nav switches sections.
   const [settingsSection, setSettingsSection] = useState<
@@ -401,7 +401,7 @@ function App() {
     trashed,
     setTrashed,
     currentThreadId,
-    setCurrentThreadId,
+    selectThreadId,
     menuThreadId,
     setMenuThreadId,
     exportDoc,
@@ -579,6 +579,7 @@ function App() {
   } = useCompactionManager({
     messages,
     currentThreadId,
+    threadIdRef,
     sessionRoot,
     busy,
     model,
@@ -615,6 +616,7 @@ function App() {
     maxContext,
     readPruneTurns,
     stagedFiles,
+    stagedExternalFiles,
   });
 
   const {
@@ -925,11 +927,11 @@ function App() {
         let ts = await listThreads();
         if (ts.length === 0) {
           const id = await createThread();
-          setCurrentThreadId(id);
+          selectThreadId(id);
           setMessages([]);
           ts = await listThreads();
         } else {
-          setCurrentThreadId(ts[0].id);
+          selectThreadId(ts[0].id);
           setMessages(await loadThread(ts[0].id));
         }
         setThreads(ts);
@@ -938,6 +940,23 @@ function App() {
         setError(`Couldn't load history: ${e}`);
       }
     })();
+  }, []);
+
+  // Check for updates silently on startup.
+  useEffect(() => {
+    let active = true;
+    check()
+      .then((u) => {
+        if (active && u) {
+          setAvailableUpdate(u);
+        }
+      })
+      .catch(() => {
+        // Silently ignore if offline, in development mode, or endpoint unreachable.
+      });
+    return () => {
+      active = false;
+    };
   }, []);
 
   // Keep the transcript pinned while the reader is at the bottom. Fires on content
@@ -992,7 +1011,25 @@ function App() {
   // Load the per-chat config (documents + system prompt + tool switches) when
   // the thread changes.
   useEffect(() => {
-    if (currentThreadId == null) return;
+    if (currentThreadId == null) {
+      hydratedThread.current = null;
+      setAdded([]);
+      setMadeInChat([]);
+      setStagedFiles([]);
+      setStagedExternalFiles([]);
+      setCompaction(null);
+      setSystemPrompt("");
+      setSystemScope("global");
+      applyThreadTools(
+        view === "code" ? SESSION_TOOLS_DEFAULT : CHAT_TOOLS_DEFAULT,
+      );
+      return;
+    }
+    // If runTurn just created, configured, and marked this thread hydrated,
+    // skip the redundant loadThreadConfig re-fetch to avoid clobbering live turn state.
+    if (hydratedThread.current === currentThreadId) {
+      return;
+    }
     let cancelled = false;
     hydratedThread.current = null;
     const firstLoad = !didInitView.current;
@@ -1035,6 +1072,7 @@ function App() {
           setMadeInChat([]);
           setStagedFiles([]);
           setStagedExternalFiles([]);
+          setCompaction(null);
           applyThreadTools(CHAT_TOOLS_DEFAULT);
           setSystemPrompt("");
           setSystemScope("global");
@@ -1048,6 +1086,7 @@ function App() {
         setMadeInChat([]);
         setStagedFiles([]);
         setStagedExternalFiles([]);
+        setCompaction(null);
         applyThreadTools(CHAT_TOOLS_DEFAULT);
         setSystemPrompt("");
         setSystemScope("global");
@@ -1057,7 +1096,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [currentThreadId]);
+  }, [currentThreadId, view]);
 
   // Persist the per-chat config when documents, the system prompt, or the
   // per-thread TOOL SWITCHES change — but only once this thread's config has
@@ -1118,7 +1157,6 @@ function App() {
       thinkingEffort,
       maxContext,
       maxToolCalls,
-      sequentialToolCalls,
       system_global_chat: globalSystemChat,
       system_global_code: globalSystemCode,
       profile_name: profileName,
@@ -1150,7 +1188,6 @@ function App() {
     thinkingEffort,
     maxContext,
     maxToolCalls,
-    sequentialToolCalls,
     globalSystemChat,
     globalSystemCode,
     profileName,
@@ -1245,7 +1282,12 @@ function App() {
       // A fresh write — track it as a made-in-chat document (not auto-pinned to tail).
       trackDocument(path, "chat");
     }
-    setTimeout(() => openNote(path), 250);
+    const tid = threadIdRef.current;
+    setTimeout(() => {
+      if (threadIdRef.current === tid) {
+        openNote(path);
+      }
+    }, 250);
   }
 
   // Stick to the bottom while the reader is there — but make that state robust, and
@@ -1418,7 +1460,34 @@ function App() {
       } else if (event.type === "reasoning") {
         state.setRacc(state.racc() + event.text);
         state.appendText("reasoning", event.text);
+      } else if (event.type === "promote_to_reasoning") {
+        // Chat template prefilled `<think>` in the prompt and emitted a closing
+        // `</think>` without an opening tag. Promote only the current step's
+        // trailing text segment into reasoning so prior iterations' text in a
+        // multi-step tool turn stays intact.
+        const last = state.segs[state.segs.length - 1];
+        if (last && last.kind === "text") {
+          const curAcc = state.acc();
+          if (curAcc.endsWith(last.text)) {
+            state.setAcc(curAcc.slice(0, curAcc.length - last.text.length));
+          }
+          const promoted = last.text.startsWith("\n\n")
+            ? last.text.slice(2)
+            : last.text;
+          state.setRacc(state.racc() + promoted);
+          const prev = state.segs[state.segs.length - 2];
+          if (prev && prev.kind === "reasoning") {
+            prev.text += promoted;
+            state.segs.pop();
+          } else {
+            (last as unknown as { kind: "reasoning"; text: string }).kind = "reasoning";
+            last.text = promoted;
+          }
+          toolExecutedSinceDelta = state.segs.some((s) => s.kind === "tool");
+          state.commit();
+        }
       } else if (event.type === "tool_start") {
+        state.commit();
         setPendingTool(event.name);
         toolExecutedSinceDelta = true;
       } else if (event.type === "tool_call") {
@@ -1430,6 +1499,7 @@ function App() {
           name: event.name,
           args: event.arguments,
           title: toolTitle(event.name, event.arguments),
+          extra_content: event.extra_content,
         };
         if (event.name === "run_python") {
           try {
@@ -1486,6 +1556,7 @@ function App() {
         const out = await runPython(event.code);
         resolveCode(event.id, out).catch(() => {});
       } else if (event.type === "tool_approval") {
+        state.commit();
         setPendingEdit({
           id: event.id,
           tool: event.tool,
@@ -1495,8 +1566,10 @@ function App() {
           command: event.command,
         });
       } else if (event.type === "error") {
+        state.commit();
         setError(event.message);
       } else if (event.type === "done") {
+        state.commit();
         state.onDone?.(event.finish_reason);
       }
     };
@@ -1517,6 +1590,7 @@ function App() {
         `Project folder not found: ${sessionRoot}\nThe folder may have been moved, renamed, or deleted. Please relocate or choose a new folder before sending messages.`,
       );
       turnBusyRef.current = false;
+      setBusy(false);
       return;
     }
 
@@ -1542,8 +1616,10 @@ function App() {
               toolsOn,
               webSearchOn,
               webFetchOn,
+              webOn,
               visionOn,
               godotToolsOn,
+              browserOn,
               liteTools,
               codeGroupsOn,
               mdWriteOn,
@@ -1558,11 +1634,12 @@ function App() {
           }),
         ).catch(() => {});
         hydratedThread.current = id;
-        setCurrentThreadId(id);
+        selectThreadId(id);
         setThreads(await listThreads());
       } catch (e) {
         setError(`Couldn't start a chat to save this in: ${e}`);
         turnBusyRef.current = false;
+        setBusy(false);
         return;
       }
     }
@@ -1586,13 +1663,38 @@ function App() {
         toolSegIdx[s.id] = i;
       }
     }
-    const commit = () => setSegments(segs.slice());
+    // Coalesce high-frequency delta/reasoning segment renders to animation frames
+    // (~60Hz) while keeping `acc`/`racc`/`segs` mutations synchronous for tool
+    // boundaries and turn persistence.
+    let rafId: number | null = null;
+    const cancelCommit = () => {
+      if (rafId !== null && typeof cancelAnimationFrame === "function") {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+    };
+    const commit = () => {
+      cancelCommit();
+      setSegments(segs.slice());
+    };
+    const scheduleCommit = () => {
+      if (typeof requestAnimationFrame !== "function") {
+        setSegments(segs.slice());
+        return;
+      }
+      if (rafId === null) {
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          setSegments(segs.slice());
+        });
+      }
+    };
     if (segs.length > 0) commit();
     const appendText = (kind: "text" | "reasoning", text: string) => {
       const last = segs[segs.length - 1];
       if (last && last.kind === kind) last.text += text;
       else segs.push({ kind, text });
-      commit();
+      scheduleCommit();
     };
     try {
       if (samplingOn) {
@@ -1639,6 +1741,7 @@ function App() {
       if (sessionRoot && initialSegments.some((s) => s.kind === "tool" && (s.name === "read_file" || s.name === "project_read")) && !toolsToSend.includes("read_file")) {
         toolsToSend.push("read_file");
       }
+      let lastFinishReason: string | null = null;
       await sendChat(
         {
           model,
@@ -1647,7 +1750,6 @@ function App() {
           reasoning_style: activeConnDef().reasoning ?? null,
           max_context_tokens: contextCap(),
           max_tool_calls: toolCallCap(),
-          sequential_tool_calls: sequentialToolCalls,
           ...samplingParams(),
         },
         toolsToSend,
@@ -1666,6 +1768,9 @@ function App() {
           appendText,
           toolSegIdx,
           commit,
+          onDone: (reason) => {
+            lastFinishReason = reason;
+          },
         }),
         readPruneTurns,
       );
@@ -1693,9 +1798,17 @@ function App() {
           ]
         : history;
       if (generatedContent) {
+        cancelCommit();
         setMessages(final);
         setSegments([]);
         setPendingTool(null);
+      } else {
+        cancelCommit();
+        setSegments([]);
+        setPendingTool(null);
+        if (lastFinishReason !== "cancelled" && !isStopping) {
+          setNotice("The model returned an empty response — resend to try again.");
+        }
       }
       await persist(final);
     } catch (e) {
@@ -1725,6 +1838,8 @@ function App() {
         await persist(partial).catch(() => {});
       }
     } finally {
+      cancelPython();
+      cancelCommit();
       setSegments([]);
       setPendingEdit(null);
       setPendingTool(null);
@@ -1737,13 +1852,22 @@ function App() {
 
   const onSendRef = useRef(onSend);
   useEffect(() => { onSendRef.current = onSend; });
+  const viewRef = useRef(view);
+  useEffect(() => { viewRef.current = view; });
+  const isCompactingRef = useRef(isCompacting);
+  useEffect(() => { isCompactingRef.current = isCompacting; });
+  const sessionRootRef = useRef(sessionRoot);
+  useEffect(() => { sessionRootRef.current = sessionRoot; });
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let mounted = true;
     import("@tauri-apps/api/event").then(({ listen }) => {
       listen("process_crash", (e: any) => {
-        const { id, code, tail } = e.payload as { id: number, code: number, tail: string };
+        const { id, code, tail, root } = e.payload as { id: number, code: number, tail: string, root?: string };
+        if (viewRef.current !== "code") return;
+        if (isCompactingRef.current) return;
+        if (root && sessionRootRef.current !== root) return;
         console.log("Process crashed:", e.payload);
         const text = `[SYSTEM MESSAGE: Background Process Crashed]\nThe background process (Task ${id}) exited with error code ${code}.\n\nLast logs:\n\`\`\`\n${tail}\n\`\`\`\n\nPlease review these logs and fix the issue.`;
         onSendRef.current(text);
@@ -1780,6 +1904,7 @@ function App() {
     if (turnBusyRef.current || busy || !model) return;
     if (!text && images.length === 0 && stagedFiles.length === 0 && stagedExternalFiles.length === 0) return;
     turnBusyRef.current = true;
+    setBusy(true);
     const imgs = images;
     setImages([]);
     // Compaction: one command, one note. `/compact` folds the prior note and the
@@ -1788,6 +1913,7 @@ function App() {
     // decides how much raw transcript is shown, never what is remembered.
     if (/^\/compact(\s|$)/i.test(text)) {
       turnBusyRef.current = false;
+      setBusy(false);
       runCompaction();
       return;
     }
@@ -1797,6 +1923,7 @@ function App() {
     // already handles clearing compaction state, so /clear doesn't duplicate that.
     if (/^\/clear\s*$/i.test(text)) {
       turnBusyRef.current = false;
+      setBusy(false);
       if (messages.length === 0 && !compaction) {
         setError("Nothing to clear — the transcript is already empty.");
         return;
@@ -1805,6 +1932,9 @@ function App() {
       const hadNote = !!compaction;
       setMessages([]);
       setSegments([]);
+      if (compaction && compaction.up_to !== 0) {
+        setCompaction({ ...compaction, up_to: 0 });
+      }
       // Persist the wipe immediately — otherwise switching chats (or relaunching)
       // reloads the thread from the store, where the old transcript still lives,
       // and the "cleared" messages come back.
@@ -1822,6 +1952,7 @@ function App() {
     // on any thread compacted before this command existed.
     if (/^\/uncompact\s*$/i.test(text)) {
       turnBusyRef.current = false;
+      setBusy(false);
       if (!compaction) {
         setError("Nothing to undo — this thread isn't compacted.");
         return;
@@ -1837,6 +1968,7 @@ function App() {
     // Pre-compute vector embeddings for the active project repository (/index)
     if (/^\/index\s*$/i.test(text)) {
       turnBusyRef.current = false;
+      setBusy(false);
       if (!sessionRoot) {
         setError("Open a project folder first to index its code.");
         return;
@@ -1848,10 +1980,19 @@ function App() {
     const externalFilesToRead = [...stagedExternalFiles];
     setStagedFiles([]);
     setStagedExternalFiles([]);
-    setBusy(true);
 
     void (async () => {
       try {
+        const MAX_STAGED_CHARS = 32_000;
+        const capStagedContent = (raw: string) => {
+          if (raw.length <= MAX_STAGED_CHARS) return raw;
+          const totalLines = raw.split("\n").length;
+          return (
+            `${raw.slice(0, MAX_STAGED_CHARS)}\n\n` +
+            `[content truncated at ${MAX_STAGED_CHARS} characters (of ${totalLines} lines) — pass start and lines to read_file to inspect specific ranges]`
+          );
+        };
+
         const initialSegments: Segment[] = [];
         if (filesToRead.length > 0) {
           for (let i = 0; i < filesToRead.length; i++) {
@@ -1874,7 +2015,7 @@ function App() {
               name: toolName,
               args,
               title: toolTitle(toolName, args),
-              output: content,
+              output: capStagedContent(content),
             });
           }
         }
@@ -1890,7 +2031,7 @@ function App() {
               name: toolName,
               args,
               title: toolTitle(toolName, args),
-              output: ext.content,
+              output: capStagedContent(ext.content),
             });
           }
         }
@@ -1940,6 +2081,9 @@ function App() {
     if (lastUser >= 0) {
       turnBusyRef.current = true;
       setBusy(true);
+      if (compaction && compaction.up_to > lastUser) {
+        setCompaction({ ...compaction, up_to: lastUser });
+      }
       const priorAssistant = messages[lastUser + 1];
       const initialSegs = priorAssistant?.segments?.filter(
         (s) => s.kind === "tool" && s.id?.startsWith("call_init_"),
@@ -1950,6 +2094,7 @@ function App() {
 
   async function stop() {
     try {
+      cancelPython();
       if (pendingEdit) {
         resolveEdit(pendingEdit.id, "reject:Turn stopped by user").catch(() => {});
         setPendingEdit(null);
@@ -2001,6 +2146,9 @@ function App() {
     const edited = { ...messages[i], content: text, created_at: Date.now() };
     turnBusyRef.current = true;
     setBusy(true);
+    if (compaction && compaction.up_to > i) {
+      setCompaction({ ...compaction, up_to: i });
+    }
     void runTurn([...messages.slice(0, i), edited]);
   }
 
@@ -2049,6 +2197,8 @@ function App() {
   }
 
   const appContextValue = {
+    availableUpdate,
+    setAvailableUpdate,
     viewingNote,
     viewerKind,
     noteContent,
@@ -2111,8 +2261,6 @@ function App() {
     setMaxContext,
     maxToolCalls,
     setMaxToolCalls,
-    sequentialToolCalls,
-    setSequentialToolCalls,
     readPruneTurns,
     setReadPruneTurns,
     permAutoWrites,

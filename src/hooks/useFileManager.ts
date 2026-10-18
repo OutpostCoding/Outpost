@@ -144,11 +144,19 @@ export function useFileManager(opts: FileManagerOptions) {
     }
   }
 
+  const openSeqRef = useRef(0);
+  const docsSeq = useRef(0);
+  const filesSeq = useRef(0);
+  const modSeq = useRef(0);
+  const diffSeq = useRef(0);
+
   // View an HTML page's raw source in the viewer (read mode, not rendered).
   async function openPageSource(name: string) {
     refreshNotes();
+    const seq = ++openSeqRef.current;
     try {
       const content = await readNote(name);
+      if (seq !== openSeqRef.current) return;
       setViewerWidth(DEFAULT_VIEWER_WIDTH);
       setViewerKind("note");
       setCompactionMeta(null);
@@ -159,6 +167,7 @@ export function useFileManager(opts: FileManagerOptions) {
       setNoteRaw(true);
       setFilesOpen(true);
     } catch (e) {
+      if (seq !== openSeqRef.current) return;
       setError(`Couldn't open ${name}: ${e}`);
     }
   }
@@ -177,8 +186,10 @@ export function useFileManager(opts: FileManagerOptions) {
 
   async function openNote(name: string) {
     refreshNotes();
+    const seq = ++openSeqRef.current;
     try {
       const content = await readNote(name);
+      if (seq !== openSeqRef.current) return;
       setViewerWidth(DEFAULT_VIEWER_WIDTH);
       setViewerKind("note");
       setCompactionMeta(null);
@@ -189,14 +200,10 @@ export function useFileManager(opts: FileManagerOptions) {
       setNoteRaw(false);
       setFilesOpen(true);
     } catch (e) {
+      if (seq !== openSeqRef.current) return;
       setError(`Couldn't open ${name}: ${e}`);
     }
   }
-
-  const docsSeq = useRef(0);
-  const filesSeq = useRef(0);
-  const modSeq = useRef(0);
-  const diffSeq = useRef(0);
 
   // Refresh the project's markdown docs (the session-side file list).
   async function refreshProjectDocs(root = sessionRoot) {
@@ -314,6 +321,7 @@ export function useFileManager(opts: FileManagerOptions) {
   // refresh the project files, docs, and modified files immediately, and close any
   // open note from the previous project so the drawer isn't stuck viewing a stale file.
   const prevRootRef = useRef<string | null>(sessionRoot);
+  const prevThreadRef = useRef<number | null>(currentThreadId);
   useEffect(() => {
     if (prevRootRef.current !== sessionRoot) {
       closeNote();
@@ -323,7 +331,12 @@ export function useFileManager(opts: FileManagerOptions) {
       setFolderMissing(false);
       setExpandedDirs(getStoredExpandedDirs(sessionRoot));
       prevRootRef.current = sessionRoot;
+    } else if (prevThreadRef.current !== currentThreadId) {
+      if (viewerKind === "compaction") {
+        closeNote();
+      }
     }
+    prevThreadRef.current = currentThreadId;
 
     if (sessionRoot) {
       void refreshProjectFiles(sessionRoot);
@@ -334,7 +347,7 @@ export function useFileManager(opts: FileManagerOptions) {
       void refreshNotes();
       setModifiedFiles(new Set());
     }
-  }, [sessionRoot, currentThreadId]);
+  }, [sessionRoot, currentThreadId, viewerKind]);
 
   // Window focus: refresh files if the drawer is currently open,
   // catching any external filesystem changes (e.g. git, IDE, external edits).
@@ -387,8 +400,10 @@ export function useFileManager(opts: FileManagerOptions) {
     if (lower.endsWith(".md") || lower.endsWith(".markdown")) {
       return openProjectDoc(path);
     }
+    const seq = ++openSeqRef.current;
     try {
       const content = await readProjectFile(sessionRoot, path);
+      if (seq !== openSeqRef.current) return;
       setViewerWidth(DEFAULT_VIEWER_WIDTH);
       setViewerKind("code");
       setCompactionMeta(null);
@@ -402,6 +417,7 @@ export function useFileManager(opts: FileManagerOptions) {
       setFilesOpen(true);
       void loadFileDiff(path, sessionRoot);
     } catch (e) {
+      if (seq !== openSeqRef.current) return;
       setError(`Couldn't open ${path}: ${e}`);
     }
   }
@@ -411,8 +427,10 @@ export function useFileManager(opts: FileManagerOptions) {
   // project_write stays approval-gated).
   async function openProjectDoc(path: string) {
     if (!sessionRoot) return;
+    const seq = ++openSeqRef.current;
     try {
       const content = await readProjectDoc(sessionRoot, path);
+      if (seq !== openSeqRef.current) return;
       setViewerWidth(DEFAULT_VIEWER_WIDTH);
       setViewerKind("project");
       setCompactionMeta(null);
@@ -426,6 +444,7 @@ export function useFileManager(opts: FileManagerOptions) {
       setFilesOpen(true);
       void loadFileDiff(path, sessionRoot);
     } catch (e) {
+      if (seq !== openSeqRef.current) return;
       setError(`Couldn't open ${path}: ${e}`);
     }
   }
@@ -460,6 +479,7 @@ export function useFileManager(opts: FileManagerOptions) {
   }
 
   function closeNote() {
+    openSeqRef.current++;
     setViewingNote(null);
     setNoteEditing(false);
     setShowDiff(false);

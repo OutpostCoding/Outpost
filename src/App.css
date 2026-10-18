@@ -693,6 +693,9 @@ body,
   color: var(--muted);
 }
 .settings-nav-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   text-align: left;
   padding: 7px 10px;
   border: none;
@@ -701,6 +704,14 @@ body,
   color: var(--text);
   font-size: 13.5px;
   cursor: pointer;
+}
+.settings-update-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #64b358;
+  box-shadow: 0 0 6px rgba(100, 179, 88, 0.4);
+  flex-shrink: 0;
 }
 .settings-nav-item:hover {
   background: var(--surface);

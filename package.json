@@ -1,7 +1,7 @@
 {
   "name": "outpost",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.4.1",
   "type": "module",
   "license": "GPL-3.0-or-later",
   "scripts": {
@@ -10,6 +10,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "node run-tests.mjs",
+    "eval": "node evals/runner.mjs",
+    "sync:release": "node scripts/sync-release.js",
     "publish:release": "node scripts/publish-release.js"
   },
   "dependencies": {

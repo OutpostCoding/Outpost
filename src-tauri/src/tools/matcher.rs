@@ -109,7 +109,10 @@ pub fn harmonize_snippet_indent(
         for line in lines {
             if line.trim().is_empty() {
                 adjusted_lines.push(String::new());
-            } else if line.len() >= strip_len && line[..strip_len].chars().all(|c| c.is_whitespace()) {
+            } else if line.len() >= strip_len
+                && line.is_char_boundary(strip_len)
+                && line[..strip_len].chars().all(|c| c.is_whitespace())
+            {
                 adjusted_lines.push(line[strip_len..].to_string());
             } else {
                 adjusted_lines.push(line.to_string());
@@ -168,12 +171,15 @@ fn fuzzy_spans(needle: &str, haystack: &str) -> Vec<(usize, usize)> {
 }
 
 /// How a snippet edit resolved against the file's current content.
+#[derive(Debug, PartialEq, Eq)]
 pub enum SnippetMatch {
     /// One exact, byte-identical occurrence — the strict path.
     Exact,
-    /// No exact hit; exactly one whitespace-insensitive match was used.
-    Fuzzy,
-    /// Too many matches to pick safely (exact or whitespace-insensitive).
+    /// No exact hit; matched via whitespace/indentation/comment normalization (1-based line span).
+    Fuzzy { start_line: usize, end_line: usize },
+    /// Matched via top/bottom anchor or sliding-window line similarity (1-based line span).
+    Approximate { start_line: usize, end_line: usize },
+    /// Too many matches to pick safely (exact or fuzzy).
     Ambiguous(usize),
     /// Nothing matched, exactly or fuzzily.
     NotFound(Option<String>),
@@ -348,7 +354,7 @@ fn match_ignoring_comments(
     }
 }
 
-/// Match by Top Anchor and Bottom Anchor for models that provide anchor lines or ellipsis.
+/// Match by Top Anchor and Bottom Anchor when the model explicitly elides middle lines with `...`.
 fn match_top_bottom_anchors(
     cur_trimmed: &[&str],
     target_lines: &[&str],
@@ -364,6 +370,9 @@ fn match_top_bottom_anchors(
     }
 
     let has_ellipsis = non_blank.iter().any(|l| is_ellipsis_line(l));
+    if !has_ellipsis {
+        return None;
+    }
     let first = non_blank.first().copied().unwrap();
     let last = non_blank.last().copied().unwrap();
 
@@ -415,24 +424,7 @@ fn match_top_bottom_anchors(
                 }
             }
 
-            if has_ellipsis {
-                matches.push((start_pos, j));
-            } else if non_blank.len() >= 3 {
-                // Verify intermediate line agreement
-                let span_slice = &cur_trimmed[start_pos..=j];
-                let mut matched_intermediate = 0;
-                for t in &non_blank[1..non_blank.len() - 1] {
-                    if span_slice.contains(t) {
-                        matched_intermediate += 1;
-                    }
-                }
-                let needed = ((non_blank.len() - 2) as f32 * 0.3).ceil() as usize;
-                if matched_intermediate >= needed.max(1) {
-                    matches.push((start_pos, j));
-                }
-            } else {
-                matches.push((start_pos, j));
-            }
+            matches.push((start_pos, j));
         }
     }
 
@@ -446,6 +438,11 @@ fn match_top_bottom_anchors(
 }
 
 /// Match by sliding window line similarity (>= 80% line agreement) when a model has a minor typo or omitted line.
+///
+/// Safety invariant: the first and last lines of `target_lines` MUST match the window boundaries
+/// (`cur_trimmed[i] == target_lines[0]` and `cur_trimmed[i + w - 1] == target_lines[w - 1]`).
+/// Without boundary anchoring, an 80% match where the leading or trailing lines of `old_string`
+/// are wrong would silently overwrite adjacent lines outside the intended edit span.
 fn match_sliding_window(
     cur_trimmed: &[&str],
     target_lines: &[&str],
@@ -460,6 +457,9 @@ fn match_sliding_window(
     let mut second_best_score = 0;
 
     for i in 0..=(cur_trimmed.len() - w) {
+        if cur_trimmed[i] != target_lines[0] || cur_trimmed[i + w - 1] != target_lines[w - 1] {
+            continue;
+        }
         let mut score = 0;
         for j in 0..w {
             if cur_trimmed[i + j] == target_lines[j] {
@@ -525,7 +525,7 @@ pub fn resolve_snippet_edit(current: &str, old: &str, new: &str) -> (String, Sni
             let end_line = line_matches[0] + target_lines.len();
             let harmonized = harmonize_snippet_indent(&cur_lines[start_line - 1..end_line], &old, &new);
             let updated = splice_lines(current, start_line, end_line, &harmonized);
-            return (updated, SnippetMatch::Fuzzy);
+            return (updated, SnippetMatch::Fuzzy { start_line, end_line });
         } else if line_matches.len() > 1 {
             return (String::new(), SnippetMatch::Ambiguous(line_matches.len()));
         }
@@ -535,43 +535,51 @@ pub fn resolve_snippet_edit(current: &str, old: &str, new: &str) -> (String, Sni
     if let Some(res) = match_ignoring_comments(&cur_trimmed, target_lines) {
         match res {
             Ok((start_idx, end_idx)) => {
+                let start_line = start_idx + 1;
+                let end_line = end_idx + 1;
                 let harmonized = harmonize_snippet_indent(&cur_lines[start_idx..=end_idx], &old, &new);
-                let updated = splice_lines(current, start_idx + 1, end_idx + 1, &harmonized);
-                return (updated, SnippetMatch::Fuzzy);
+                let updated = splice_lines(current, start_line, end_line, &harmonized);
+                return (updated, SnippetMatch::Fuzzy { start_line, end_line });
             }
             Err(n) => return (String::new(), SnippetMatch::Ambiguous(n)),
         }
     }
 
-    // 4. Anchor matching tier (Top & Bottom Anchoring with verified span or ellipsis)
-    if let Some(res) = match_top_bottom_anchors(&cur_trimmed, target_lines) {
-        match res {
-            Ok((start_idx, end_idx)) => {
-                let harmonized = harmonize_snippet_indent(&cur_lines[start_idx..=end_idx], &old, &new);
-                let updated = splice_lines(current, start_idx + 1, end_idx + 1, &harmonized);
-                return (updated, SnippetMatch::Fuzzy);
-            }
-            Err(n) => return (String::new(), SnippetMatch::Ambiguous(n)),
-        }
-    }
-
-    // 5. Token-level fuzzy match (for mid-line edits, with smart boundary alignment)
+    // 4. Token-level fuzzy match (for mid-line edits, with smart boundary alignment)
     let spans = fuzzy_spans(old.as_str(), current);
     if spans.len() == 1 {
         let (s, e) = spans[0];
+        let start_line = current[..s].matches('\n').count() + 1;
+        let end_line = current[..e].matches('\n').count() + 1;
         let updated = apply_boundary_replacement(current, s, e, &new);
-        return (updated, SnippetMatch::Fuzzy);
+        return (updated, SnippetMatch::Fuzzy { start_line, end_line });
     } else if spans.len() > 1 {
         return (String::new(), SnippetMatch::Ambiguous(spans.len()));
+    }
+
+    // 5. Anchor matching tier (Top & Bottom Anchoring for explicit `...` ellipsis blocks)
+    if let Some(res) = match_top_bottom_anchors(&cur_trimmed, target_lines) {
+        match res {
+            Ok((start_idx, end_idx)) => {
+                let start_line = start_idx + 1;
+                let end_line = end_idx + 1;
+                let harmonized = harmonize_snippet_indent(&cur_lines[start_idx..=end_idx], &old, &new);
+                let updated = splice_lines(current, start_line, end_line, &harmonized);
+                return (updated, SnippetMatch::Approximate { start_line, end_line });
+            }
+            Err(n) => return (String::new(), SnippetMatch::Ambiguous(n)),
+        }
     }
 
     // 6. Sliding-window line similarity (for near-exact matches with minor typos/discrepancies)
     if let Some(res) = match_sliding_window(&cur_trimmed, target_lines) {
         match res {
             Ok((start_idx, end_idx)) => {
+                let start_line = start_idx + 1;
+                let end_line = end_idx + 1;
                 let harmonized = harmonize_snippet_indent(&cur_lines[start_idx..=end_idx], &old, &new);
-                let updated = splice_lines(current, start_idx + 1, end_idx + 1, &harmonized);
-                return (updated, SnippetMatch::Fuzzy);
+                let updated = splice_lines(current, start_line, end_line, &harmonized);
+                return (updated, SnippetMatch::Approximate { start_line, end_line });
             }
             Err(n) => return (String::new(), SnippetMatch::Ambiguous(n)),
         }
@@ -612,7 +620,10 @@ pub fn align_symbol_replacement_indent(target_indent: &str, new_text: &str) -> S
         for line in lines {
             if line.trim().is_empty() {
                 adjusted.push(String::new());
-            } else if line.len() >= strip && line[..strip].chars().all(|c| c.is_whitespace()) {
+            } else if line.len() >= strip
+                && line.is_char_boundary(strip)
+                && line[..strip].chars().all(|c| c.is_whitespace())
+            {
                 adjusted.push(line[strip..].to_string());
             } else {
                 adjusted.push(line.to_string());
@@ -658,15 +669,27 @@ pub fn resolve_symbol_edit(
 
         let (updated_scoped, matched) = resolve_snippet_edit(scoped_content, old_str, new);
         match matched {
-            SnippetMatch::Exact | SnippetMatch::Fuzzy => {
+            SnippetMatch::Exact | SnippetMatch::Fuzzy { .. } | SnippetMatch::Approximate { .. } => {
                 let mut full_updated = String::with_capacity(current.len() + updated_scoped.len());
                 full_updated.push_str(&current[..scope_start]);
                 full_updated.push_str(&updated_scoped);
                 full_updated.push_str(&current[scope_end..]);
-                let matched_note = format!(
-                    " (scoped to symbol '{symbol}' at lines {}-{})",
-                    loc.start_line, loc.end_line
-                );
+                let matched_note = if matches!(matched, SnippetMatch::Approximate { .. }) {
+                    format!(
+                        " (scoped to symbol '{symbol}' at lines {}-{}, matched approximately via anchor/similarity fallback; indentation automatically harmonized)",
+                        loc.start_line, loc.end_line
+                    )
+                } else if matches!(matched, SnippetMatch::Fuzzy { .. }) {
+                    format!(
+                        " (scoped to symbol '{symbol}' at lines {}-{}, indentation automatically harmonized)",
+                        loc.start_line, loc.end_line
+                    )
+                } else {
+                    format!(
+                        " (scoped to symbol '{symbol}' at lines {}-{})",
+                        loc.start_line, loc.end_line
+                    )
+                };
                 Ok((full_updated, matched_note))
             }
             SnippetMatch::Ambiguous(n) => Err(format!(
@@ -890,7 +913,7 @@ mod edit_match_tests {
     fn fuzzy_fallback_replaces_the_wider_actual_span() {
         let (updated, m) = resolve_snippet_edit("a\n    b\nc\n", "a\nb\nc", "A\nC");
         assert_eq!(updated, "A\nC\n");
-        assert!(matches!(m, SnippetMatch::Fuzzy));
+        assert_eq!(m, SnippetMatch::Fuzzy { start_line: 1, end_line: 3 });
     }
 
     #[test]
@@ -925,7 +948,7 @@ mod edit_match_tests {
         let note = "# Title\n\n- item one\n  - nested\n- item three\n";
         let (updated, m) =
             resolve_snippet_edit(note, "- item one\n- nested", "- item ONE\n  - nested");
-        assert!(matches!(m, SnippetMatch::Fuzzy));
+        assert!(matches!(m, SnippetMatch::Fuzzy { .. }));
         assert_eq!(updated, "# Title\n\n- item ONE\n  - nested\n- item three\n");
     }
 
@@ -936,7 +959,7 @@ mod edit_match_tests {
         let page = "<li>alpha beta</li>\n";
         let (updated, m) =
             resolve_snippet_edit(page, "<li>alpha  beta</li>", "<li>ALPHA beta</li>");
-        assert!(matches!(m, SnippetMatch::Fuzzy));
+        assert!(matches!(m, SnippetMatch::Fuzzy { .. }));
         assert_eq!(updated, "<li>ALPHA beta</li>\n");
     }
 
@@ -953,7 +976,7 @@ mod edit_match_tests {
         let new = "    let a = 10;\n    let b = 20;";
         let (updated, m) = resolve_snippet_edit(cur, old, new);
         assert_eq!(updated, "fn main() {\n    let a = 10;\n    let b = 20;\n}\n");
-        assert!(matches!(m, SnippetMatch::Fuzzy));
+        assert_eq!(m, SnippetMatch::Fuzzy { start_line: 2, end_line: 3 });
     }
 
     #[test]
@@ -979,12 +1002,12 @@ mod edit_match_tests {
         let new = "    let x = 2;\n";
         let (updated, m) = resolve_snippet_edit(cur, old, new);
         assert_eq!(updated, "    let x = 2;\n");
-        assert!(matches!(m, SnippetMatch::Fuzzy));
+        assert_eq!(m, SnippetMatch::Fuzzy { start_line: 1, end_line: 1 });
 
         let cur2 = "fn foo() {\n    let x = 1;\n    let y = 2;\n}\n";
         let (updated2, m2) = resolve_snippet_edit(cur2, "let  x  =  1;", "    let x = 10;\n");
         assert_eq!(updated2, "fn foo() {\n    let x = 10;\n    let y = 2;\n}\n");
-        assert!(matches!(m2, SnippetMatch::Fuzzy));
+        assert_eq!(m2, SnippetMatch::Fuzzy { start_line: 2, end_line: 2 });
     }
 
     #[test]
@@ -994,7 +1017,7 @@ mod edit_match_tests {
         let new = "    let val = 99;";
         let (updated, m) = resolve_snippet_edit(cur, old, new);
         assert_eq!(updated, "fn test() {\n    let val = 99;\n}\n");
-        assert!(matches!(m, SnippetMatch::Fuzzy));
+        assert_eq!(m, SnippetMatch::Fuzzy { start_line: 2, end_line: 2 });
     }
 
     #[test]
@@ -1003,7 +1026,7 @@ mod edit_match_tests {
         let old = "let x = 1;\nlet y = 2;\nx + y";
         let new = "let x = 10;\nlet y = 20;\nx + y";
         let (updated, m) = resolve_snippet_edit(cur, old, new);
-        assert!(matches!(m, SnippetMatch::Fuzzy));
+        assert_eq!(m, SnippetMatch::Fuzzy { start_line: 2, end_line: 5 });
         // Harmonizer automatically indents the replacement to match the enclosing block
         assert_eq!(
             updated,
@@ -1017,7 +1040,7 @@ mod edit_match_tests {
         let old = "pub fn router() -> Router {\n    // ... existing code ...\n    .route(\"/c\", get(c))\n}";
         let new = "pub fn router() -> Router {\n    Router::new()\n        .route(\"/all\", get(all))\n}";
         let (updated, m) = resolve_snippet_edit(cur, old, new);
-        assert!(matches!(m, SnippetMatch::Fuzzy));
+        assert!(matches!(m, SnippetMatch::Approximate { start_line: 1, end_line: 6 }));
         assert_eq!(
             updated,
             "pub fn router() -> Router {\n    Router::new()\n        .route(\"/all\", get(all))\n}\n"
@@ -1031,11 +1054,40 @@ mod edit_match_tests {
         let old = "let step_one = 1;\nlet step_tw = 2;\nlet step_three = 3;\nlet step_four = 4;\nlet step_five = 5;";
         let new = "let step_all = 999;";
         let (updated, m) = resolve_snippet_edit(cur, old, new);
-        assert!(matches!(m, SnippetMatch::Fuzzy));
+        assert!(matches!(m, SnippetMatch::Approximate { start_line: 2, end_line: 6 }));
         // Harmonizer automatically indents the replacement to match the enclosing block
         assert_eq!(
             updated,
             "fn process() {\n    let step_all = 999;\n}\n"
+        );
+    }
+
+    #[test]
+    fn sliding_window_refuses_mismatched_boundary_lines_to_prevent_clobbering_neighbors() {
+        // 5 lines where lines 1..=4 match (80% similarity), but line 5 of old_string
+        // is a guessed line that does NOT match line 5 of the file ("- **Undo.**").
+        // Sliding window must refuse rather than clobbering line 5.
+        let cur = "- **Step 1.** a\n- **Step 2.** b\n- **Step 3.** c\n- **Step 4.** d\n- **Undo.** keep me\n";
+        let old = "- **Step 1.** a\n- **Step 2.** b\n- **Step 3.** c\n- **Step 4.** d\n- **Permissions.** wrong tail";
+        let (_, m) = resolve_snippet_edit(cur, old, "replaced");
+        assert!(
+            matches!(m, SnippetMatch::NotFound(_)),
+            "sliding window must not match when boundary lines differ"
+        );
+    }
+
+    #[test]
+    fn non_ellipsis_snippet_does_not_collapse_wide_span_via_top_bottom_anchors() {
+        // Without an explicit `...` ellipsis, a 4-line snippet whose top and bottom lines
+        // happen to match a 9-line block (with only 1 intermediate line in common) must NOT
+        // collapse the 9-line block.
+        let cur = "fn setup() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n    let d = 4;\n    let e = 5;\n    let f = 6;\n    let g = 7;\n}\n";
+        let old = "fn setup() {\n    let a = 1;\n    let wrong = 99;\n}";
+        let (_, m) = resolve_snippet_edit(cur, old, "fn setup() {}");
+        assert!(
+            matches!(m, SnippetMatch::NotFound(_)),
+            "non-ellipsis snippet must not collapse a 9-line span: got {:?}",
+            m
         );
     }
 
@@ -1045,7 +1097,7 @@ mod edit_match_tests {
         let old = "start()\nfinish()";
         let new = "start()\nif ready():\n    proceed()\nfinish()";
         let (updated, m) = resolve_snippet_edit(cur, old, new);
-        assert!(matches!(m, SnippetMatch::Fuzzy));
+        assert_eq!(m, SnippetMatch::Fuzzy { start_line: 3, end_line: 4 });
         assert_eq!(
             updated,
             "class Service:\n    def execute(self):\n        start()\n        if ready():\n            proceed()\n        finish()\n"
@@ -1058,7 +1110,7 @@ mod edit_match_tests {
         let old = "step1()\nstep2()";
         let new = "step1()\nstep_extra()\nstep2()";
         let (updated, m) = resolve_snippet_edit(cur, old, new);
-        assert!(matches!(m, SnippetMatch::Fuzzy));
+        assert_eq!(m, SnippetMatch::Fuzzy { start_line: 4, end_line: 5 });
         assert_eq!(
             updated,
             "package main\n\nfunc Run() {\n\tstep1()\n\tstep_extra()\n\tstep2()\n}\n"
@@ -1163,5 +1215,14 @@ mod symbol_edit_tests {
         assert!(updated.contains("status := 201"));
     }
 
-
+    #[test]
+    fn harmonize_snippet_indent_does_not_panic_on_multibyte_utf8() {
+        // old_indent is 4 spaces, target_indent is 2 spaces -> strip_len is 2 bytes.
+        // A line with 1 space + 3-byte character '—' (em-dash, byte len 3) has len 4 >= 2,
+        // but byte 2 lands inside '—'. This must not panic.
+        let snippet = "    first line\n — bullet\n    third line";
+        let adjusted = harmonize_snippet_indent(&["  target"], "    ", snippet);
+        assert!(adjusted.contains("first line"));
+        assert!(adjusted.contains(" — bullet"));
+    }
 }

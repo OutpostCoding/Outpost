@@ -75,12 +75,16 @@ pub struct PermissionStore {
 
 impl PermissionStore {
     /// Open (or start) the policy at `path`. A missing/unreadable file starts fully
-    /// gated (safe default).
+    /// gated (safe default). Legacy whitelist entries that are now intrinsically
+    /// auto-approved read-only git commands (e.g. `git status`, `git diff`, `git log`)
+    /// are pruned on load so they don't linger as redundant custom pills in Settings.
     pub fn open(path: PathBuf) -> Self {
-        let data = std::fs::read_to_string(&path)
+        let mut data = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<PermData>(&s).ok())
             .unwrap_or_default();
+        data.command_whitelist
+            .retain(|p| !is_readonly_git_tokens(p.split_whitespace()));
         Self {
             path,
             data: Mutex::new(data),
@@ -124,10 +128,8 @@ impl PermissionStore {
             let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
             (d.auto_commands, d.command_whitelist.clone())
         };
-        if !auto_cmds {
-            return false;
-        }
-        command_auto_approved(command, &whitelist)
+        let active_wl: &[String] = if auto_cmds { &whitelist } else { &[] };
+        command_auto_approved(command, active_wl)
     }
 
     /// Auto-approve an `argv`-form command (no shell; see [`argv_passes_guards`]).
@@ -136,10 +138,8 @@ impl PermissionStore {
             let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
             (d.auto_commands, d.command_whitelist.clone())
         };
-        if !auto_cmds {
-            return false;
-        }
-        argv_auto_approved(display, argv, &whitelist)
+        let active_wl: &[String] = if auto_cmds { &whitelist } else { &[] };
+        argv_auto_approved(display, argv, active_wl)
     }
 
     /// The patterns to persist so `command` would auto-approve next time — the leading
@@ -162,6 +162,35 @@ impl PermissionStore {
     }
 }
 
+fn strip_program_extension(prog: &str) -> &str {
+    for ext in &[".exe", ".cmd", ".bat", ".ps1"] {
+        if let Some(stripped) = prog.strip_suffix(ext) {
+            return stripped;
+        }
+    }
+    prog
+}
+
+const INTERPRETERS: &[&str] = &[
+    "py", "python", "python3", "node", "bun", "deno", "ruby", "perl", "php",
+];
+
+fn has_eval_flag<'a>(mut tokens: impl Iterator<Item = &'a str>) -> bool {
+    tokens.any(|tok| {
+        let t = tok.to_ascii_lowercase();
+        t == "-c"
+            || t.starts_with("-c")
+            || t == "-e"
+            || t.starts_with("-e")
+            || t == "--eval"
+            || t.starts_with("--eval=")
+            || t == "-p"
+            || t.starts_with("-p")
+            || t == "--print"
+            || t.starts_with("--print=")
+    })
+}
+
 /// Split a shell command into its top-level segments (on `&&` and `;`), honouring
 /// quotes, so a compound command can be judged segment by segment (a whitelisted
 /// `git add -A && git commit -m "x"` should auto-approve, while `git status && rm -rf .`
@@ -169,7 +198,7 @@ impl PermissionStore {
 ///
 /// Returns `None` — a hard refusal, never auto-approvable — for any construct we do
 /// not try to reason about: a pipe or redirection, a PowerShell
-/// subexpression/escape (`$(`, `${`, `(`, `)`, backtick), a bare background `&`, a
+/// subexpression/escape (`$(`, `${`, `(`, `)`, `{`, `}`, backtick), a bare background `&`, a
 /// newline, or an unterminated quote. Quotes are honoured so a `&&`/`;`/metachar
 /// INSIDE them stays literal data, and are stripped from the returned segments —
 /// but `$` and backtick are still refused inside double quotes, where PowerShell
@@ -200,7 +229,7 @@ fn shell_segments(command: &str) -> Option<Vec<String>> {
                     }
                 }
                 ';' => out.push(std::mem::take(&mut cur)),
-                '|' | '>' | '<' | '(' | ')' | '`' => return None,
+                '|' | '>' | '<' | '(' | ')' | '{' | '}' | '`' => return None,
                 '$' => {
                     // `$(...)`/`${...}` are evaluated by PowerShell — refuse.
                     if matches!(chars.peek(), Some('(') | Some('{')) {
@@ -257,9 +286,13 @@ fn segment_passes_guards(seg: &str) -> bool {
         return false;
     }
     let first = cmd.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
-    let first = first.strip_suffix(".exe").unwrap_or(first.as_str());
+    let first = strip_program_extension(&first);
     // Refuse PowerShell variables, environment variables, or assignments ($env:VAR, $x = 1, etc.)
     if first.starts_with('$') || BLACKLIST.contains(&first) {
+        return false;
+    }
+    // Block inline code evaluation on script interpreters (-c, -e, --eval, -p, --print)
+    if INTERPRETERS.contains(&first) && has_eval_flag(cmd.split_whitespace().skip(1)) {
         return false;
     }
     // Block git `-c` and `--config-env` which can smuggle arbitrary shell commands via aliases/hooks
@@ -289,16 +322,48 @@ fn pattern_matches(cmd: &str, pattern: &str) -> bool {
 /// Extract the tight pattern to whitelist for this command segment.
 /// For tools with subcommands (git, npm, cargo, etc.), includes the first non-flag
 /// subcommand (e.g. "npm test", "git status", "cargo check"). For npm/pnpm/yarn/bun
-/// with "run", includes the script target (e.g. "npm run dev"). Single-command tools
-/// (pytest, tsc, ruff) extract just the program token.
+/// with "run", includes the script target (e.g. "npm run dev").
+/// Interpreters (py, python, node, etc.) require script target or -m module and never
+/// fall back to bare interpreter prefixes. Single-command tools (pytest, tsc, ruff)
+/// extract just the program token.
 fn extract_tight_pattern(cmd: &str) -> String {
     let mut tokens = cmd.split_whitespace();
     let Some(first) = tokens.next() else {
         return String::new();
     };
     let prog = first.to_ascii_lowercase();
-    let prog = prog.strip_suffix(".exe").unwrap_or(&prog);
+    let prog = strip_program_extension(&prog);
     match prog {
+        "py" | "python" | "python3" => {
+            if let Some(second) = tokens.next() {
+                if second == "-m" {
+                    if let Some(third) = tokens.next() {
+                        if !third.starts_with('-') {
+                            return format!("{first} {second} {third}");
+                        }
+                    }
+                } else if !second.starts_with('-') {
+                    return format!("{first} {second}");
+                }
+            }
+            String::new()
+        }
+        "node" | "ruby" | "perl" | "php" => {
+            if let Some(second) = tokens.next() {
+                if !second.starts_with('-') {
+                    return format!("{first} {second}");
+                }
+            }
+            String::new()
+        }
+        "npx" => {
+            if let Some(second) = tokens.next() {
+                if !second.starts_with('-') {
+                    return format!("{first} {second}");
+                }
+            }
+            String::new()
+        }
         "git" | "npm" | "cargo" | "pnpm" | "yarn" | "bun" | "dotnet" | "pip" => {
             if let Some(second) = tokens.next() {
                 if !second.starts_with('-') {
@@ -318,23 +383,140 @@ fn extract_tight_pattern(cmd: &str) -> String {
     }
 }
 
+/// True if a sequence of tokens (from a whitespace-split shell segment or `argv`)
+/// is a strictly read-only `git` inspection command (e.g. `git status`, `git log -n 5`,
+/// `git diff`, `git show`, `git blame`, `git rev-parse`, `git branch --show-current`).
+///
+/// Caller MUST still enforce [`segment_passes_guards`] / [`argv_passes_guards`] so path
+/// escapes (`..`, absolute paths), shell metacharacters, and `git -c` / `--config-env`
+/// remain blocked. This additionally blocks subcommand flags that can write files or
+/// execute external helpers (`--output`, `-o`, `--ext-diff`, `--textconv`, `--exec`,
+/// `--git-dir`, `--work-tree`).
+fn is_readonly_git_tokens<'a>(mut tokens: impl Iterator<Item = &'a str>) -> bool {
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let prog = first.trim().to_ascii_lowercase();
+    if strip_program_extension(&prog) != "git" {
+        return false;
+    }
+
+    // Consume safe read-only global flags before the subcommand.
+    let sub = loop {
+        let Some(tok) = tokens.next() else {
+            return false; // bare `git` with no subcommand
+        };
+        if matches!(tok, "--no-pager" | "-P" | "--no-optional-locks" | "--bare") {
+            continue;
+        }
+        if tok.starts_with('-') {
+            return false; // reject global flags like -C, --git-dir, --work-tree, -c, --exec-path
+        }
+        break tok.to_ascii_lowercase();
+    };
+
+    let rest: Vec<&str> = tokens.collect();
+
+    // Disallow flags that write output to disk, invoke external helpers, or redirect repo paths.
+    let has_unsafe_flag = rest.iter().any(|raw| {
+        let t = raw.trim_matches(['"', '\'']).to_ascii_lowercase();
+        t == "-o"
+            || t.starts_with("-o")
+            || t == "--output"
+            || t.starts_with("--output=")
+            || t == "--ext-diff"
+            || t == "--textconv"
+            || t == "--exec"
+            || t.starts_with("--exec=")
+            || t == "--git-dir"
+            || t.starts_with("--git-dir=")
+            || t == "--work-tree"
+            || t.starts_with("--work-tree=")
+    });
+    if has_unsafe_flag {
+        return false;
+    }
+
+    match sub.as_str() {
+        "status" | "log" | "diff" | "show" | "blame" | "shortlog" | "rev-parse" | "ls-files"
+        | "ls-tree" | "cat-file" | "describe" => true,
+        "reflog" => {
+            // `git reflog` / `git reflog show` are read-only; `expire` and `delete` mutate.
+            !rest.iter().any(|raw| {
+                let t = raw.trim_matches(['"', '\'']).to_ascii_lowercase();
+                matches!(t.as_str(), "expire" | "delete" | "exists")
+            })
+        }
+        "branch" => {
+            // Read-only only when listing/querying (no positional branch creation or -d/-D/-m/-M/-c/-C/-f).
+            rest.iter().all(|raw| {
+                let t = raw.trim_matches(['"', '\'']);
+                matches!(
+                    t,
+                    "-a" | "--all"
+                        | "-r"
+                        | "--remotes"
+                        | "-v"
+                        | "-vv"
+                        | "--verbose"
+                        | "-l"
+                        | "--list"
+                        | "--show-current"
+                        | "--merged"
+                        | "--no-merged"
+                        | "--color"
+                        | "--no-color"
+                        | "--abbrev"
+                        | "--no-abbrev"
+                        | "--column"
+                        | "--no-column"
+                ) || t.starts_with("--sort=")
+                    || t.starts_with("--format=")
+                    || t.starts_with("--points-at=")
+                    || t.starts_with("--contains=")
+                    || t.starts_with("--no-contains=")
+                    || t.starts_with("--merged=")
+                    || t.starts_with("--no-merged=")
+            })
+        }
+        "remote" => {
+            // Bare `git remote` or `git remote -v` / `--verbose` is read-only.
+            rest.iter().all(|raw| {
+                let t = raw.trim_matches(['"', '\'']);
+                matches!(t, "-v" | "--verbose")
+            })
+        }
+        "tag" => {
+            // Bare `git tag` or `git tag -l` / `--list` (with no positional tag creation).
+            rest.is_empty()
+                || (rest.len() == 1
+                    && matches!(rest[0].trim_matches(['"', '\'']), "-l" | "--list"))
+        }
+        _ => false,
+    }
+}
+
 /// The security core for the shell form (pure, so it's easy to reason about). A
-/// command auto-approves only if every segment clears the guards AND matches a
-/// whitelisted prefix — so `git add -A && git commit -m "x"` can auto-approve under a
+/// command auto-approves only if every segment clears the guards AND either is an
+/// intrinsically safe read-only `git` inspection command or matches a whitelisted
+/// prefix — so `git add -A && git commit -m "x"` can auto-approve under a
 /// `git add` + `git commit` pattern, while `git status && rm -rf .` cannot (`rm` is blacklisted).
 pub fn command_auto_approved(command: &str, whitelist: &[String]) -> bool {
     match shell_segments(command) {
-        Some(segs) => segs
-            .iter()
-            .all(|s| segment_passes_guards(s) && whitelist.iter().any(|p| pattern_matches(s, p))),
+        Some(segs) => segs.iter().all(|s| {
+            segment_passes_guards(s)
+                && (is_readonly_git_tokens(s.split_whitespace())
+                    || whitelist.iter().any(|p| pattern_matches(s, p)))
+        }),
         None => false,
     }
 }
 
 /// The leading tokens to add to the whitelist so THIS command's every segment would
-/// auto-approve next time. Empty when the command can never auto-approve (it fails a
-/// guard), so the UI can offer a disabled "Always allow" rather than one that
-/// silently does nothing.
+/// auto-approve next time. Segments that are already intrinsically auto-approved
+/// (read-only `git` inspection) are skipped so compound commands like
+/// `git status && cargo test` only remember `cargo test`. Empty when the command can
+/// never auto-approve (it fails a guard) or needs no new patterns.
 pub fn command_remember_tokens(command: &str) -> Vec<String> {
     let Some(segs) = shell_segments(command) else {
         return Vec::new();
@@ -344,6 +526,9 @@ pub fn command_remember_tokens(command: &str) -> Vec<String> {
     }
     let mut out: Vec<String> = Vec::new();
     for s in &segs {
+        if is_readonly_git_tokens(s.split_whitespace()) {
+            continue;
+        }
         let pattern = extract_tight_pattern(s);
         if !pattern.is_empty() && !out.contains(&pattern) {
             out.push(pattern);
@@ -364,8 +549,12 @@ pub fn argv_passes_guards(argv: &[String]) -> bool {
         return false;
     };
     let prog = program.trim().to_ascii_lowercase();
-    let prog = prog.strip_suffix(".exe").unwrap_or(prog.as_str());
+    let prog = strip_program_extension(&prog);
     if prog.is_empty() || prog.starts_with('$') || BLACKLIST.contains(&prog) {
+        return false;
+    }
+    // Block inline code evaluation on script interpreters (-c, -e, --eval, -p, --print)
+    if INTERPRETERS.contains(&prog) && has_eval_flag(argv.iter().skip(1).map(|s| s.as_str())) {
         return false;
     }
     if prog == "git"
@@ -378,24 +567,58 @@ pub fn argv_passes_guards(argv: &[String]) -> bool {
     !argv.iter().any(|a| a.contains("..") || has_absolute_path(a))
 }
 
-/// Auto-approve an `argv` command: it clears the argv guards and its display string
+/// Auto-approve an `argv` command: it clears the argv guards and either is an
+/// intrinsically safe read-only `git` inspection command or its display string
 /// matches a whitelisted prefix.
 pub fn argv_auto_approved(display: &str, argv: &[String], whitelist: &[String]) -> bool {
-    argv_passes_guards(argv) && whitelist.iter().any(|p| pattern_matches(display, p))
+    argv_passes_guards(argv)
+        && (is_readonly_git_tokens(argv.iter().map(|s| s.as_str()))
+            || whitelist.iter().any(|p| pattern_matches(display, p)))
 }
 
 /// The program token to whitelist so this argv command would auto-approve next time.
-/// Empty when it can never auto-approve (blacklisted program / escaping argument).
+/// Empty when it is already intrinsically auto-approved (read-only `git` inspection)
+/// or can never auto-approve (blacklisted program / escaping argument).
 pub fn argv_remember_tokens(argv: &[String]) -> Vec<String> {
-    if !argv_passes_guards(argv) {
+    if !argv_passes_guards(argv) || is_readonly_git_tokens(argv.iter().map(|s| s.as_str())) {
         return Vec::new();
     }
     let Some(first) = argv.first() else {
         return Vec::new();
     };
     let prog = first.to_ascii_lowercase();
-    let prog = prog.strip_suffix(".exe").unwrap_or(&prog);
+    let prog = strip_program_extension(&prog);
     match prog {
+        "py" | "python" | "python3" => {
+            if let Some(second) = argv.get(1) {
+                if second == "-m" {
+                    if let Some(third) = argv.get(2) {
+                        if !third.starts_with('-') {
+                            return vec![format!("{first} {second} {third}")];
+                        }
+                    }
+                } else if !second.starts_with('-') {
+                    return vec![format!("{first} {second}")];
+                }
+            }
+            Vec::new()
+        }
+        "node" | "ruby" | "perl" | "php" => {
+            if let Some(second) = argv.get(1) {
+                if !second.starts_with('-') {
+                    return vec![format!("{first} {second}")];
+                }
+            }
+            Vec::new()
+        }
+        "npx" => {
+            if let Some(second) = argv.get(1) {
+                if !second.starts_with('-') {
+                    return vec![format!("{first} {second}")];
+                }
+            }
+            Vec::new()
+        }
         "git" | "npm" | "cargo" | "pnpm" | "yarn" | "bun" | "dotnet" | "pip" => {
             if let Some(second) = argv.get(1) {
                 if !second.starts_with('-') {
@@ -649,10 +872,12 @@ mod tests {
             command_remember_tokens(r#"git add -A && git commit -m "msg""#),
             vec!["git add".to_string(), "git commit".to_string()]
         );
+        // `git status` is intrinsically auto-approved, so only `npm test` needs remembering.
         assert_eq!(
             command_remember_tokens("git status && npm test"),
-            vec!["git status".to_string(), "npm test".to_string()]
+            vec!["npm test".to_string()]
         );
+        assert!(command_remember_tokens("git status").is_empty());
         assert_eq!(
             command_remember_tokens("cargo check && pytest tests/"),
             vec!["cargo check".to_string(), "pytest".to_string()]
@@ -665,6 +890,11 @@ mod tests {
         assert_eq!(
             argv_remember_tokens(&argv(&["npm", "run", "test"])),
             vec!["npm run test".to_string()]
+        );
+        assert!(argv_remember_tokens(&argv(&["git", "status"])).is_empty());
+        assert_eq!(
+            argv_remember_tokens(&argv(&["git", "commit", "-m", "msg"])),
+            vec!["git commit".to_string()]
         );
         // A command that can never auto-approve offers nothing to remember.
         assert!(command_remember_tokens("git status && rm -rf .").is_empty());
@@ -752,5 +982,215 @@ mod tests {
         assert!(store.command_auto_approved("pytest"));
         assert!(store.argv_auto_approved("pytest", &["pytest".to_string()]));
         let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn extensions_are_stripped_for_blacklist_guards() {
+        let wl = vec!["powershell".to_string(), "rm".to_string(), "del".to_string()];
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for cmd in [
+            "powershell.exe -Command calc",
+            "powershell.cmd -Command calc",
+            "powershell.bat -Command calc",
+            "powershell.ps1 -Command calc",
+            "rm.exe -rf .",
+            "del.bat /f /q *",
+        ] {
+            assert!(!command_auto_approved(cmd, &wl), "should have gated: {cmd}");
+            assert!(command_remember_tokens(cmd).is_empty(), "remember should be empty: {cmd}");
+        }
+        assert!(!argv_auto_approved("powershell.exe", &argv(&["powershell.exe"]), &wl));
+        assert!(!argv_auto_approved("rm.cmd", &argv(&["rm.cmd", "-rf", "."]), &wl));
+        assert!(argv_remember_tokens(&argv(&["powershell.bat"])).is_empty());
+    }
+
+    #[test]
+    fn curly_braces_in_shell_segments_are_refused() {
+        let wl = vec!["pytest".to_string(), "git".to_string()];
+        assert!(!command_auto_approved("pytest { Start-Process calc }", &wl));
+        assert!(!command_auto_approved("git status; { rm -rf . }", &wl));
+        assert!(command_remember_tokens("pytest { calc }").is_empty());
+        // Inside quotes, braces are literal data
+        assert!(command_auto_approved("git commit -m '{fix}'", &wl));
+    }
+
+    #[test]
+    fn interpreter_inline_eval_flags_are_refused() {
+        let wl = vec![
+            "python".to_string(),
+            "py".to_string(),
+            "node".to_string(),
+            "ruby".to_string(),
+        ];
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for cmd in [
+            r#"python -c "import os; os.system('calc')""#,
+            r#"py -c "import os; os.system('calc')""#,
+            r#"node -e "process.exit()""#,
+            r#"node --eval "process.exit()""#,
+            r#"ruby -e "exit""#,
+            r#"python -p "print(1)""#,
+            r#"python --print "1""#,
+        ] {
+            assert!(!command_auto_approved(cmd, &wl), "should have gated eval flag: {cmd}");
+            assert!(command_remember_tokens(cmd).is_empty(), "remember should be empty: {cmd}");
+        }
+
+        assert!(!argv_auto_approved(
+            r#"python -c "exit()""#,
+            &argv(&["python", "-c", "exit()"]),
+            &wl
+        ));
+        assert!(!argv_auto_approved(
+            r#"node --eval "exit()""#,
+            &argv(&["node", "--eval", "exit()"]),
+            &wl
+        ));
+        assert!(argv_remember_tokens(&argv(&["python", "-c", "exit()"])).is_empty());
+    }
+
+    #[test]
+    fn interpreter_tight_patterns_require_script_or_module() {
+        // py -m <mod>
+        assert_eq!(
+            command_remember_tokens("py -m pytest tests/"),
+            vec!["py -m pytest".to_string()]
+        );
+        assert_eq!(
+            command_remember_tokens("python3 -m unittest discover"),
+            vec!["python3 -m unittest".to_string()]
+        );
+        // python <script>
+        assert_eq!(
+            command_remember_tokens("python main.py --port 8080"),
+            vec!["python main.py".to_string()]
+        );
+        // node <script>
+        assert_eq!(
+            command_remember_tokens("node index.js --dev"),
+            vec!["node index.js".to_string()]
+        );
+        // npx <pkg>
+        assert_eq!(
+            command_remember_tokens("npx vitest run"),
+            vec!["npx vitest".to_string()]
+        );
+
+        // Bare interpreter commands must NEVER fall back to bare prefix
+        assert!(command_remember_tokens("python").is_empty());
+        assert!(command_remember_tokens("python.exe").is_empty());
+        assert!(command_remember_tokens("py").is_empty());
+        assert!(command_remember_tokens("node").is_empty());
+        assert!(command_remember_tokens("npx").is_empty());
+
+        // Same for argv form
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            argv_remember_tokens(&argv(&["py", "-m", "pytest", "tests/"])),
+            vec!["py -m pytest".to_string()]
+        );
+        assert_eq!(
+            argv_remember_tokens(&argv(&["node", "server.js"])),
+            vec!["node server.js".to_string()]
+        );
+        assert_eq!(
+            argv_remember_tokens(&argv(&["npx", "vitest"])),
+            vec!["npx vitest".to_string()]
+        );
+        assert!(argv_remember_tokens(&argv(&["python"])).is_empty());
+        assert!(argv_remember_tokens(&argv(&["node"])).is_empty());
+    }
+
+    #[test]
+    fn readonly_git_inspection_auto_approves_without_whitelist() {
+        let empty_wl: Vec<String> = Vec::new();
+        let argv = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Read-only git commands auto-approve even with an empty whitelist.
+        for cmd in [
+            "git status",
+            "git status --short -b",
+            "git log -n 5 --stat",
+            "git log --oneline -10",
+            "git diff",
+            "git diff --staged src/main.rs",
+            "git show HEAD:src/main.rs",
+            "git blame -L 10,20 src/lib.rs",
+            "git rev-parse HEAD",
+            "git ls-files",
+            "git branch",
+            "git branch -a -v",
+            "git branch --show-current",
+            "git remote -v",
+            "git tag -l",
+            "git reflog -n 5",
+            "git --no-pager log -n 3",
+            "git status; git diff --stat",
+        ] {
+            assert!(
+                command_auto_approved(cmd, &empty_wl),
+                "expected read-only git command to auto-approve: {cmd}"
+            );
+        }
+
+        assert!(argv_auto_approved(
+            "git log -n 5 --stat",
+            &argv(&["git", "log", "-n", "5", "--stat"]),
+            &empty_wl
+        ));
+        assert!(argv_auto_approved(
+            "git show HEAD:src/App.tsx",
+            &argv(&["git", "show", "HEAD:src/App.tsx"]),
+            &empty_wl
+        ));
+
+        // Store with auto_commands: false (default fresh install) still allows read-only git inspection.
+        let tmp = std::env::temp_dir().join(format!(
+            "test_git_ro_{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = PermissionStore::open(tmp.clone());
+        assert!(!store.auto_commands());
+        assert!(store.command_auto_approved("git log -n 5"));
+        assert!(store.argv_auto_approved("git status", &argv(&["git", "status"])));
+        assert!(!store.command_auto_approved("git commit -m 'msg'"));
+        let _ = std::fs::remove_file(tmp);
+
+        // Mutating or unsafe git commands/flags must NOT auto-approve without explicit whitelist.
+        for gated in [
+            "git",
+            "git add .",
+            "git commit -m 'x'",
+            "git push",
+            "git pull",
+            "git checkout -b feat",
+            "git switch main",
+            "git reset --hard",
+            "git clean -fd",
+            "git stash",
+            "git branch new-branch",
+            "git branch -D old-branch",
+            "git branch -m new-name",
+            "git tag v1.0.0",
+            "git remote add origin https://example.com",
+            "git reflog expire --all",
+            "git reflog delete HEAD@{1}",
+            "git diff --output=out.patch",
+            "git log -o out.txt",
+            "git diff --ext-diff",
+            "git show --textconv HEAD",
+            "git -C ../other status",
+            "git --git-dir=/tmp/repo status",
+            "git -c core.pager=calc log",
+            "git status && cargo test",
+        ] {
+            assert!(
+                !command_auto_approved(gated, &empty_wl),
+                "expected mutating/unsafe git command to gate: {gated}"
+            );
+        }
     }
 }

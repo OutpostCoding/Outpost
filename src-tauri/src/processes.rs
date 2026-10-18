@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 
-use tokio::io::AsyncBufReadExt;
 use tokio::process::Child;
 
 #[cfg(windows)]
@@ -29,13 +28,246 @@ use windows::Win32::Foundation::*;
 /// the buffer without bound.
 const MAX_LINES: usize = 800;
 
+#[cfg(windows)]
+pub struct JobGuard {
+    handle: isize,
+}
+
+#[cfg(windows)]
+impl JobGuard {
+    pub fn new() -> Option<Self> {
+        unsafe {
+            let handle = CreateJobObjectW(None, None).ok()?;
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ).is_err() {
+                let _ = CloseHandle(handle);
+                return None;
+            }
+            Some(Self { handle: handle.0 as isize })
+        }
+    }
+
+    pub fn assign(&self, pid: u32) -> bool {
+        unsafe {
+            if let Ok(proc_handle) = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) {
+                let res = AssignProcessToJobObject(HANDLE(self.handle as _), proc_handle).is_ok();
+                let _ = CloseHandle(proc_handle);
+                res
+            } else {
+                false
+            }
+        }
+    }
+
+    pub fn into_raw(mut self) -> isize {
+        let h = self.handle;
+        self.handle = 0;
+        h
+    }
+}
+
+#[cfg(windows)]
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        if self.handle != 0 {
+            unsafe {
+                let _ = CloseHandle(HANDLE(self.handle as _));
+            }
+            self.handle = 0;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum RunOutcome {
+    Output(std::process::Output),
+    Cancelled,
+    TimedOut,
+    SpawnFailed(std::io::Error),
+}
+
+const MAX_CAPTURED_BYTES: usize = 1_048_576; // 1 MB cap per stream
+
+/// Run a command bounded by timeout and cancel token.
+/// Attaches a Windows Job Object with KILL_ON_JOB_CLOSE so when cancelled, timed out,
+/// or dropped, top-level shell and all grandchildren are cleanly terminated.
+/// Stdin is set to null, captured stdout/stderr streams are bounded to 1MB, and
+/// a 500ms post-exit drain timeout prevents hanging if an inherited pipe handle lingers.
+pub async fn run_captured_bounded(
+    cmd: &mut tokio::process::Command,
+    cancel: &tokio_util::sync::CancellationToken,
+    timeout_secs: u64,
+) -> RunOutcome {
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return RunOutcome::SpawnFailed(e),
+    };
+
+    #[cfg(windows)]
+    let _job = if let Some(guard) = JobGuard::new() {
+        if let Some(pid) = child.id() {
+            let _ = guard.assign(pid);
+        }
+        Some(guard)
+    } else {
+        None
+    };
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+
+    let stdout_buf_clone = stdout_buf.clone();
+    let stdout_task = tokio::spawn(async move {
+        if let Some(mut reader) = stdout {
+            use tokio::io::AsyncReadExt;
+            let mut chunk = [0u8; 8192];
+            loop {
+                let current_len = stdout_buf_clone.lock().unwrap().len();
+                if current_len >= MAX_CAPTURED_BYTES {
+                    while let Ok(n) = reader.read(&mut chunk).await {
+                        if n == 0 { break; }
+                    }
+                    break;
+                }
+                let to_read = std::cmp::min(chunk.len(), MAX_CAPTURED_BYTES - current_len);
+                match reader.read(&mut chunk[..to_read]).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        stdout_buf_clone.lock().unwrap().extend_from_slice(&chunk[..n]);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    let stderr_buf_clone = stderr_buf.clone();
+    let stderr_task = tokio::spawn(async move {
+        if let Some(mut reader) = stderr {
+            use tokio::io::AsyncReadExt;
+            let mut chunk = [0u8; 8192];
+            loop {
+                let current_len = stderr_buf_clone.lock().unwrap().len();
+                if current_len >= MAX_CAPTURED_BYTES {
+                    while let Ok(n) = reader.read(&mut chunk).await {
+                        if n == 0 { break; }
+                    }
+                    break;
+                }
+                let to_read = std::cmp::min(chunk.len(), MAX_CAPTURED_BYTES - current_len);
+                match reader.read(&mut chunk[..to_read]).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        stderr_buf_clone.lock().unwrap().extend_from_slice(&chunk[..n]);
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+
+    let timeout_duration = std::time::Duration::from_secs(timeout_secs.clamp(1, 600));
+
+    let status = tokio::select! {
+        _ = cancel.cancelled() => {
+            let _ = child.start_kill();
+            stdout_task.abort();
+            stderr_task.abort();
+            return RunOutcome::Cancelled;
+        }
+        _ = tokio::time::sleep(timeout_duration) => {
+            let _ = child.start_kill();
+            stdout_task.abort();
+            stderr_task.abort();
+            return RunOutcome::TimedOut;
+        }
+        res = child.wait() => {
+            match res {
+                Ok(s) => s,
+                Err(e) => {
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    return RunOutcome::SpawnFailed(e);
+                }
+            }
+        }
+    };
+
+    let mut stdout_task = stdout_task;
+    let mut stderr_task = stderr_task;
+    let drain_pipes = async {
+        let _ = (&mut stdout_task).await;
+        let _ = (&mut stderr_task).await;
+    };
+
+    if tokio::time::timeout(std::time::Duration::from_millis(500), drain_pipes).await.is_err() {
+        stdout_task.abort();
+        stderr_task.abort();
+    }
+
+    let stdout_bytes = std::mem::take(&mut *stdout_buf.lock().unwrap());
+    let stderr_bytes = std::mem::take(&mut *stderr_buf.lock().unwrap());
+
+    RunOutcome::Output(std::process::Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
+}
+
 struct Proc {
     command: String,
     cwd: String,
+    root: String,
     child: Child,
     logs: Arc<Mutex<Vec<String>>>,
+    crash_reported: bool,
     #[cfg(windows)]
     job_handle: Option<isize>,
+}
+
+impl Proc {
+    #[cfg(windows)]
+    fn kill_tree(&mut self) {
+        if let Some(handle) = self.job_handle.take() {
+            unsafe {
+                let _ = CloseHandle(HANDLE(handle as _));
+            }
+        } else if let Some(pid) = self.child.id() {
+            if matches!(self.child.try_wait(), Ok(None)) {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+            }
+        }
+        let _ = self.child.start_kill();
+    }
+
+    #[cfg(not(windows))]
+    fn kill_tree(&mut self) {
+        let _ = self.child.start_kill();
+    }
+}
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        self.kill_tree();
+    }
 }
 
 pub struct Processes {
@@ -57,9 +289,10 @@ impl Processes {
     /// streaming its output into a capped buffer. When `quiet` is true, suppresses
     /// live `process_log` event emission so TerminalPane is not automatically opened.
     /// Returns the handle id.
-    pub fn start(&self, command: &str, cwd: &Path, cwd_label: &str, quiet: bool) -> Result<u64, String> {
+    pub fn start(&self, command: &str, cwd: &Path, cwd_label: &str, quiet: bool, root: &str) -> Result<u64, String> {
         let mut cmd = build_command(command);
         cmd.current_dir(cwd);
+        cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         // We own the lifetime explicitly (process_stop), so don't kill on drop —
@@ -77,40 +310,29 @@ impl Processes {
         }
 
         #[cfg(windows)]
-        let mut job_handle: Option<isize> = None;
-        #[cfg(windows)]
-        unsafe {
-            if let Ok(handle) = CreateJobObjectW(None, None) {
-                let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                if SetInformationJobObject(
-                    handle,
-                    JobObjectExtendedLimitInformation,
-                    &info as *const _ as *const std::ffi::c_void,
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                ).is_ok() {
-                    if let Some(pid) = child.id() {
-                        if let Ok(proc_handle) = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) {
-                            if AssignProcessToJobObject(handle, proc_handle).is_ok() {
-                                job_handle = Some(handle.0 as isize);
-                            }
-                            let _ = CloseHandle(proc_handle);
-                        }
-                    }
+        let job_handle = if let Some(guard) = JobGuard::new() {
+            if let Some(pid) = child.id() {
+                if guard.assign(pid) {
+                    Some(guard.into_raw())
+                } else {
+                    None
                 }
-                if job_handle.is_none() {
-                    let _ = CloseHandle(handle);
-                }
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         self.map.lock().unwrap().insert(
             id,
             Proc {
                 command: command.to_string(),
                 cwd: cwd_label.to_string(),
+                root: root.to_string(),
                 child,
                 logs,
+                crash_reported: false,
                 #[cfg(windows)]
                 job_handle,
             },
@@ -131,6 +353,7 @@ impl Processes {
         cwd: &Path,
         cwd_label: &str,
         quiet: bool,
+        root: &str,
     ) -> Result<u64, String> {
         let mut cmd = tokio::process::Command::new(&argv[0]);
         cmd.args(&argv[1..]);
@@ -138,6 +361,7 @@ impl Processes {
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW, same as build_command
         apply_child_env(&mut cmd);
         cmd.current_dir(cwd);
+        cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(false);
@@ -159,40 +383,29 @@ impl Processes {
         }
 
         #[cfg(windows)]
-        let mut job_handle: Option<isize> = None;
-        #[cfg(windows)]
-        unsafe {
-            if let Ok(handle) = CreateJobObjectW(None, None) {
-                let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                if SetInformationJobObject(
-                    handle,
-                    JobObjectExtendedLimitInformation,
-                    &info as *const _ as *const std::ffi::c_void,
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                ).is_ok() {
-                    if let Some(pid) = child.id() {
-                        if let Ok(proc_handle) = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) {
-                            if AssignProcessToJobObject(handle, proc_handle).is_ok() {
-                                job_handle = Some(handle.0 as isize);
-                            }
-                            let _ = CloseHandle(proc_handle);
-                        }
-                    }
+        let job_handle = if let Some(guard) = JobGuard::new() {
+            if let Some(pid) = child.id() {
+                if guard.assign(pid) {
+                    Some(guard.into_raw())
+                } else {
+                    None
                 }
-                if job_handle.is_none() {
-                    let _ = CloseHandle(handle);
-                }
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         self.map.lock().unwrap().insert(
             id,
             Proc {
                 command: display.to_string(),
                 cwd: cwd_label.to_string(),
+                root: root.to_string(),
                 child,
                 logs,
+                crash_reported: false,
                 #[cfg(windows)]
                 job_handle,
             },
@@ -268,6 +481,7 @@ impl Processes {
                 .get_mut(&id)
                 .ok_or_else(|| format!("no managed process #{id} (already stopped?)"))?;
             if let Ok(Some(status)) = proc.child.try_wait() {
+                proc.crash_reported = true;
                 let code = status
                     .code()
                     .map(|c| format!("exited {c}"))
@@ -303,6 +517,7 @@ impl Processes {
                 .get_mut(&id)
                 .ok_or_else(|| format!("no managed process #{id} (already stopped?)"))?;
             if let Ok(Some(status)) = proc.child.try_wait() {
+                proc.crash_reported = true;
                 let code = status
                     .code()
                     .map(|c| format!("exited {c}"))
@@ -420,20 +635,7 @@ impl Processes {
             .unwrap()
             .remove(&id)
             .ok_or_else(|| format!("no managed process #{id}"))?;
-        #[cfg(windows)]
-        {
-            if let Some(handle) = proc.job_handle {
-                unsafe {
-                    let _ = CloseHandle(HANDLE(handle as _));
-                }
-            } else if let Some(pid) = proc.child.id() {
-                // Fallback to taskkill if Job Object failed
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/T", "/PID", &pid.to_string()])
-                    .spawn();
-            }
-        }
-        let _ = proc.child.start_kill();
+        proc.kill_tree();
         self.notify_stopped(id);
         Ok(format!("Stopped process #{id} (`{}`).", proc.command))
     }
@@ -453,19 +655,7 @@ impl Processes {
         let Ok(mut map) = self.map.lock() else { return };
         let stopped_ids: Vec<u64> = map.keys().copied().collect();
         for (_, mut proc) in map.drain() {
-            #[cfg(windows)]
-            {
-                if let Some(handle) = proc.job_handle {
-                    unsafe {
-                        let _ = CloseHandle(HANDLE(handle as _));
-                    }
-                } else if let Some(pid) = proc.child.id() {
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/F", "/T", "/PID", &pid.to_string()])
-                        .output();
-                }
-            }
-            let _ = proc.child.start_kill();
+            proc.kill_tree();
         }
         for id in stopped_ids {
             self.notify_stopped(id);
@@ -484,8 +674,9 @@ impl Processes {
                 if let Ok(Some(status)) = proc.child.try_wait() {
                     reported.insert(id);
                     stopped.push(id);
-                    if !status.success() {
-                        crashes.push((id, status.code().unwrap_or(1)));
+                    if !status.success() && !proc.crash_reported {
+                        proc.crash_reported = true;
+                        crashes.push((id, status.code().unwrap_or(1), proc.root.clone()));
                     }
                 }
             }
@@ -495,7 +686,7 @@ impl Processes {
             }
             if !crashes.is_empty() {
                 if let Some(app) = &self.app {
-                    for (id, code) in crashes {
+                    for (id, code, root) in crashes {
                         let tail = {
                             if let Ok(logs) = self.logs(id, 40) {
                                 logs
@@ -509,8 +700,9 @@ impl Processes {
                             id: u64,
                             code: i32,
                             tail: String,
+                            root: String,
                         }
-                        let _ = app.emit("process_crash", ProcessCrash { id, code, tail });
+                        let _ = app.emit("process_crash", ProcessCrash { id, code, tail, root });
                     }
                 }
             }
@@ -535,6 +727,9 @@ fn status_of(proc: &mut Proc) -> String {
 }
 
 /// Read a child stream line-by-line into the shared capped buffer.
+/// Splits on both `\n` and bare `\r` (so progress bars don't accumulate into
+/// single megabyte lines), cleanly handles `\r\n` without emitting blank lines,
+/// and truncates individual lines at 4,096 characters.
 fn spawn_pump<R>(
     reader: R,
     logs: Arc<Mutex<Vec<String>>>,
@@ -546,12 +741,25 @@ fn spawn_pump<R>(
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut lines = tokio::io::BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        use tokio::io::AsyncReadExt;
+        let mut reader = reader;
+        let mut buf = [0u8; 4096];
+        let mut current_line = Vec::new();
+        let mut truncated = false;
+        let mut last_was_cr = false;
+
+        let push_line = |line_bytes: &mut Vec<u8>, is_trunc: &mut bool, logs: &Arc<Mutex<Vec<String>>>, app: &Option<tauri::AppHandle>| {
+            let mut line = String::from_utf8_lossy(line_bytes).into_owned();
+            if *is_trunc {
+                line.push_str(" … [line truncated]");
+            }
+            line_bytes.clear();
+            *is_trunc = false;
+
             let mut l = logs.lock().unwrap();
             l.push(line.clone());
             if !quiet {
-                if let Some(app) = &app {
+                if let Some(app) = app {
                     use tauri::Emitter;
                     #[derive(serde::Serialize, Clone)]
                     struct ProcessLog {
@@ -561,7 +769,7 @@ fn spawn_pump<R>(
                     }
                     let _ = app.emit("process_log", ProcessLog {
                         id: proc_id,
-                        line: line.clone(),
+                        line,
                         stderr: is_stderr,
                     });
                 }
@@ -570,6 +778,37 @@ fn spawn_pump<R>(
             if over > 0 {
                 l.drain(0..over);
             }
+        };
+
+        while let Ok(n) = reader.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            for &b in &buf[..n] {
+                if last_was_cr {
+                    last_was_cr = false;
+                    if b == b'\n' {
+                        continue;
+                    }
+                }
+
+                if b == b'\n' || b == b'\r' {
+                    if b == b'\r' {
+                        last_was_cr = true;
+                    }
+                    push_line(&mut current_line, &mut truncated, &logs, &app);
+                } else {
+                    if current_line.len() < 4096 {
+                        current_line.push(b);
+                    } else {
+                        truncated = true;
+                    }
+                }
+            }
+        }
+
+        if !current_line.is_empty() || truncated {
+            push_line(&mut current_line, &mut truncated, &logs, &app);
         }
     });
 }
@@ -747,7 +986,7 @@ mod tests {
         let procs = Processes::new(None);
         // `cmd /C exit 0` exits immediately — by the time we call wait it's done.
         let id = procs
-            .start("exit 0", Path::new("."), ".", false)
+            .start("exit 0", Path::new("."), ".", false, ".")
             .expect("spawn");
         // Give it a moment to actually exit.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -763,7 +1002,7 @@ mod tests {
         // Sleep ~600ms so the first try_wait in wait() sees it running, but the
         // ~3rd poll (at 200ms intervals) catches the exit.
         let id = procs
-            .start("ping -n 2 127.0.0.1 >nul", Path::new("."), ".", false)
+            .start("ping -n 2 127.0.0.1 >nul", Path::new("."), ".", false, ".")
             .expect("spawn");
         let result = procs.wait(id, 5).await.expect("wait must not hang");
         assert!(
@@ -779,7 +1018,7 @@ mod tests {
         let procs = Processes::new(None);
         // ping -n 30 runs ~30s; we time out after 1s.
         let id = procs
-            .start("ping -n 30 127.0.0.1 >nul", Path::new("."), ".", false)
+            .start("ping -n 30 127.0.0.1 >nul", Path::new("."), ".", false, ".")
             .expect("spawn");
         let start = tokio::time::Instant::now();
         let result = procs.wait(id, 1).await.expect("wait must not hang");
@@ -809,6 +1048,7 @@ mod tests {
                 Path::new("."),
                 ".",
                 false,
+                ".",
             )
             .expect("spawn");
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -824,7 +1064,7 @@ mod tests {
     async fn quiet_process_captures_logs_without_error() {
         let procs = Processes::new(None);
         let id = procs
-            .start("exit 0", Path::new("."), ".", true)
+            .start("exit 0", Path::new("."), ".", true, ".")
             .expect("spawn quiet");
         tokio::time::sleep(Duration::from_millis(200)).await;
         let result = procs.wait(id, 5).await.expect("wait must not hang");
@@ -835,7 +1075,7 @@ mod tests {
     async fn wait_duration_returns_exit_state_and_output_on_fast_command() {
         let procs = Processes::new(None);
         let id = procs
-            .start("exit 0", Path::new("."), ".", false)
+            .start("exit 0", Path::new("."), ".", false, ".")
             .expect("spawn fast");
         let (exited, result) = procs
             .wait_duration(id, Duration::from_millis(1500))
@@ -850,7 +1090,7 @@ mod tests {
         let procs = Processes::new(None);
         let cmd = "ping -n 10 127.0.0.1 >nul";
         let id = procs
-            .start(cmd, Path::new("."), ".", false)
+            .start(cmd, Path::new("."), ".", false, ".")
             .expect("spawn long");
         let (exited, result) = procs
             .wait_duration(id, Duration::from_millis(300))
@@ -1042,6 +1282,38 @@ mod tests {
             assert!(classify_slip(prog).is_none(), "{prog} is not a slip");
         }
     }
+
+    #[tokio::test]
+    async fn spawn_pump_splits_bare_cr_and_handles_crlf_without_duplication() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let data = b"download 10%\rdownload 20%\r\ncompleted\n";
+        let cursor = std::io::Cursor::new(data);
+        spawn_pump(cursor, logs.clone(), None, 1, false, true);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let lines = logs.lock().unwrap().clone();
+        assert_eq!(
+            lines,
+            vec![
+                "download 10%".to_string(),
+                "download 20%".to_string(),
+                "completed".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_pump_truncates_lines_exceeding_4096_bytes() {
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let mut long_line = vec![b'x'; 5000];
+        long_line.push(b'\n');
+        let cursor = std::io::Cursor::new(long_line);
+        spawn_pump(cursor, logs.clone(), None, 1, false, true);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let lines = logs.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].ends_with(" … [line truncated]"));
+        assert!(lines[0].len() <= 4096 + " … [line truncated]".len());
+    }
 }
 
 /// Environment for every managed process.
@@ -1056,4 +1328,6 @@ mod tests {
 fn apply_child_env(c: &mut tokio::process::Command) {
     c.env("PYTHONUNBUFFERED", "1");
     c.env("PYTHONUTF8", "1");
+    c.env("GIT_PAGER", "cat");
+    c.env("GIT_TERMINAL_PROMPT", "0");
 }

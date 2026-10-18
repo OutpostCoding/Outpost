@@ -10,13 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::provider::{CommandApproval, StreamEvent};
 use super::*;
 
-#[derive(Debug)]
-enum RunOutcome {
-    Output(std::process::Output),
-    Cancelled,
-    TimedOut,
-    SpawnFailed(std::io::Error),
-}
+pub use crate::processes::{run_captured_bounded, RunOutcome};
 
 /// Maximum execution duration (seconds) for synchronous command execution via `run_command`.
 pub const COMMAND_TIMEOUT_SECS: u64 = 120;
@@ -24,22 +18,12 @@ pub const COMMAND_TIMEOUT_SECS: u64 = 120;
 /// One spawn attempt with the shared cancel/timeout policy: `timeout_secs` cap (clamped to 1..=600), killed on
 /// user Stop. The caller formats the failure messages (it knows the display
 /// form); this just classifies the outcome.
-async fn run_captured(
+pub(crate) async fn run_captured(
     cmd: &mut tokio::process::Command,
     cancel: &CancellationToken,
     timeout_secs: u64,
 ) -> RunOutcome {
-    let timeout_duration = std::time::Duration::from_secs(timeout_secs.clamp(1, 600));
-    tokio::select! {
-        _ = cancel.cancelled() => RunOutcome::Cancelled,
-        res = tokio::time::timeout(timeout_duration, cmd.output()) => {
-            match res {
-                Ok(Ok(o)) => RunOutcome::Output(o),
-                Ok(Err(e)) => RunOutcome::SpawnFailed(e),
-                Err(_) => RunOutcome::TimedOut,
-            }
-        }
-    }
+    run_captured_bounded(cmd, cancel, timeout_secs).await
 }
 
 
@@ -398,11 +382,12 @@ impl Tools {
                 .as_ref()
                 .and_then(|val| val["quiet"].as_bool())
                 .unwrap_or(false);
+            let root_str = root.to_string_lossy();
             let started = if let Some(ref a) = argv {
                 self.processes
-                    .start_argv(a, &command, &work_dir, &label, quiet)
+                    .start_argv(a, &command, &work_dir, &label, quiet, &root_str)
             } else {
-                self.processes.start(&command, &work_dir, &label, quiet)
+                self.processes.start(&command, &work_dir, &label, quiet, &root_str)
             };
 
             let id = match started {
@@ -476,6 +461,8 @@ impl Tools {
         // we decode the captured output as UTF-8 (from_utf8_lossy) below.
         cmd.env("PYTHONUTF8", "1");
         cmd.env("PYTHONDONTWRITEBYTECODE", "1");
+        cmd.env("GIT_PAGER", "cat");
+        cmd.env("GIT_TERMINAL_PROMPT", "0");
 
         // Race the command against Stop: if the user cancels (e.g. a command that
         // hangs on an interactive program), dropping `cmd` here kills the child
@@ -508,6 +495,8 @@ impl Tools {
                     c.kill_on_drop(true);
                     c.env("PYTHONUTF8", "1");
                     c.env("PYTHONDONTWRITEBYTECODE", "1");
+                    c.env("GIT_PAGER", "cat");
+                    c.env("GIT_TERMINAL_PROMPT", "0");
                     if let RunOutcome::Output(o) = run_captured(&mut c, cancel, timeout_secs).await {
                         outcome = RunOutcome::Output(o);
                     }

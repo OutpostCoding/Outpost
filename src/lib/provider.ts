@@ -14,6 +14,7 @@ export interface ToolCall {
   id: string;
   name: string;
   arguments: string;
+  extra_content?: Record<string, any>;
 }
 
 export interface Source {
@@ -44,6 +45,8 @@ export type Segment =
        *  it opened. Shown as a thumbnail so you can see what the model saw; the
        *  model itself receives it via a separate synthetic user turn. */
       image?: string;
+      /** Provider-specific metadata (e.g. Gemini thought_signature). */
+      extra_content?: Record<string, any>;
     };
 
 export interface Message {
@@ -99,17 +102,14 @@ export interface ChatRequest {
    *  wrap-up. Null = the backend default (40). The backend clamps to 1..=200,
    *  so there is no "no cap" — it's a runaway backstop, not a budget. */
   max_tool_calls?: number | null;
-  /** Whether to enforce sequential single-tool execution per generation round.
-   *  When true, the provider immediately halts the stream upon detecting a
-   *  second tool call, cutting generation and returning only the first call. */
-  sequential_tool_calls?: boolean | null;
 }
 
 export type StreamEvent =
   | { type: "delta"; text: string }
   | { type: "reasoning"; text: string }
+  | { type: "promote_to_reasoning" }
   | { type: "tool_start"; name: string }
-  | { type: "tool_call"; id: string; name: string; arguments: string }
+  | { type: "tool_call"; id: string; name: string; arguments: string; extra_content?: Record<string, any> }
   | { type: "tool_result"; id: string; name: string; result: string }
   | { type: "tool_image"; id: string; image: string }
   | { type: "run_code"; id: number; code: string }
@@ -132,7 +132,7 @@ export type StreamEvent =
 /** Which backend a turn routes to: an OpenAI-compatible host or Anthropic, by
  *  base URL + the keychain id under which its key is stored. */
 export interface ConnRoute {
-  kind: "openai" | "anthropic";
+  kind: "openai" | "anthropic" | "gemini";
   baseUrl: string;
   keyId: string;
   /** OBSOLETE (2026-08-30): passed through for contract compatibility — the

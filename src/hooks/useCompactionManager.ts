@@ -61,12 +61,15 @@ export interface CompactionManagerOptions {
   maxContext: string; // user-declared max-context label
   readPruneTurns?: number | null; // read history retention limit
   stagedFiles: string[]; // files staged for the NEXT turn — preview only; the framing itself is passed per-turn
+  stagedExternalFiles?: { name: string; content: string }[];
+  threadIdRef?: React.MutableRefObject<number | null>;
 }
 
 export function useCompactionManager(opts: CompactionManagerOptions) {
   const {
     messages,
     currentThreadId,
+    threadIdRef,
     sessionRoot,
     busy,
     model,
@@ -103,6 +106,7 @@ export function useCompactionManager(opts: CompactionManagerOptions) {
     maxContext,
     readPruneTurns,
     stagedFiles,
+    stagedExternalFiles,
   } = opts;
 
   // Compaction: a handover note standing in for the first `up_to` messages when
@@ -222,7 +226,9 @@ export function useCompactionManager(opts: CompactionManagerOptions) {
         },
       ];
     }
-    const upTo = Math.max(0, Math.min(compaction.up_to, msgs.length));
+    const maxUpTo =
+      msgs[msgs.length - 1]?.role === "user" ? msgs.length - 1 : msgs.length;
+    const upTo = Math.max(0, Math.min(compaction.up_to, maxUpTo));
     const kept = msgs.slice(upTo);
     const lead =
       upTo > 0
@@ -273,6 +279,7 @@ export function useCompactionManager(opts: CompactionManagerOptions) {
   // note lineage entirely once the live turns scrolled out.
   async function runCompaction() {
     if (busy || currentThreadId == null) return;
+    const startThreadId = currentThreadId;
     const KEEP_RECENT_USER_TURNS = 1;
     const userIdx = messages
       .map((m, i) => (m.role === "user" ? i : -1))
@@ -301,6 +308,10 @@ export function useCompactionManager(opts: CompactionManagerOptions) {
         model,
         connRoute(),
       );
+      const activeId = threadIdRef ? threadIdRef.current : currentThreadId;
+      if (activeId !== startThreadId) {
+        return;
+      }
       const next: Compaction = { summary, up_to: upTo, at: Date.now() };
       setCompaction(next);
       setNotice(
@@ -324,7 +335,10 @@ export function useCompactionManager(opts: CompactionManagerOptions) {
   // What the inspector previews. Simulate the next turn with a placeholder user message
   // when files are staged, so their framing, position, and token cost are visible.
   function previewMessages(): Message[] {
-    const pending = stagedFiles;
+    const pending = [
+      ...stagedFiles,
+      ...(stagedExternalFiles?.map((f) => f.name) ?? []),
+    ];
     if (pending.length > 0) {
       const last = messages[messages.length - 1];
       if (!last || last.role !== "user") {
@@ -344,6 +358,7 @@ export function useCompactionManager(opts: CompactionManagerOptions) {
 
   // Keep a live context preview for the token-count button + inspector.
   useEffect(() => {
+    let cancelled = false;
     previewContext(
       previewMessages(),
       enabledToolList(),
@@ -358,8 +373,13 @@ export function useCompactionManager(opts: CompactionManagerOptions) {
       contextCap(),
       readPruneTurns,
     )
-      .then(setPreview)
+      .then((p) => {
+        if (!cancelled) setPreview(p);
+      })
       .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [
     messages,
     compaction,
@@ -396,6 +416,7 @@ export function useCompactionManager(opts: CompactionManagerOptions) {
     // Staged-attachment framing is part of the send, so the inspector has to
     // re-run when the staged set changes or the preview under-reports it.
     stagedFiles,
+    stagedExternalFiles,
   ]);
 
   // Context-full nudge: proactive notice when context usage passes 80% of the

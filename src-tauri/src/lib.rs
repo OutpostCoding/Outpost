@@ -211,16 +211,30 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app_handle, event| {
+        .run(|app_handle, event| match event {
             // Take the managed processes down with the app. They're deliberately
             // spawned detached (a dev server must outlive the tool call), and on
             // Windows nothing reaps them on exit — so without this, quitting leaves
             // an orphaned server squatting on its port until Task Manager.
-            if matches!(event, tauri::RunEvent::Exit) {
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Destroyed,
+                ..
+            } if label == "main" => {
+                use tauri::Manager;
+                if let Some(w) = app_handle.get_webview_window("perception") {
+                    let _ = w.destroy();
+                }
+                let state = app_handle.state::<AppState>();
+                state.processes.stop_all();
+                app_handle.exit(0);
+            }
+            tauri::RunEvent::Exit => {
                 use tauri::Manager;
                 let state = app_handle.state::<AppState>();
                 state.processes.stop_all();
             }
+            _ => {}
         });
 }
 

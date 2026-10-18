@@ -144,26 +144,14 @@ description: "Search the user's markdown notes by keyword — their written mate
             },
             Tool {
                 name: "read_file".into(),
-                description: "Read the full contents of a file in the project. Use to inspect source code, configuration, or documentation before planning edits. Read-only.".into(),
+                description: "Read the contents of a file in the project. Omit 'start' and 'lines' to read the full file (up to 32000 chars), or pass 'start' and 'lines' to inspect a specific 1-based line range in a large file. Read-only.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Relative path of the file within the project, e.g. 'src/main.rs'." },
+                        "start": { "type": "integer", "description": "Optional 1-based line number to start reading from. Omit to read from the beginning of the file. Alias: 'start_line', 'offset', 'from'." },
+                        "lines": { "type": "integer", "description": "Optional number of lines to read starting from 'start' (max 2000). Omit to read to the end of the file (up to max_chars). Alias: 'limit', 'count'." },
                         "max_chars": { "type": "integer", "description": "Optional output cap in characters (default 32000, max 100000)." }
-                    },
-                    "required": ["path"]
-                }),
-            },
-            Tool {
-                name: "read_file_lines".into(),
-                description: "Read a specific line range of a file instead of the whole file. Lines are 1-based and inclusive. Read-only.".into(),
-                parameters: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string", "description": "Relative path of the file within the project." },
-                        "start": { "type": "integer", "description": "First line to read (1-based, alias 'start_line' or 'from'). Defaults to 1." },
-                        "end": { "type": "integer", "description": "Last line to read (1-based, inclusive, alias 'end_line' or 'to'). Defaults to the end of the file." },
-                        "max_chars": { "type": "integer", "description": "Optional output cap in characters (1000-50000, default 32000)." }
                     },
                     "required": ["path"]
                 }),
@@ -232,7 +220,7 @@ description: "Search the user's markdown notes by keyword — their written mate
             },
             Tool {
                 name: "typecheck".into(),
-                description: "Run the project's static typechecker or syntax validator ONCE: `tsc --noEmit` for TypeScript, `cargo check` for Rust, or `compileall` for Python (runs all applicable). A cheap post-edit sanity pass — call it after a batch of edits to catch syntax and type errors before running the app. The command is fixed and takes no arguments, so it runs without prompting; results are capped like run_command. For languages with no compiler-style checker it says so instead of guessing. Takes no arguments.".into(),
+                description: "Run the project's static typechecker or syntax validator ONCE: `tsc --noEmit` for TypeScript (root or `frontend`/`client`/`web`/`ui` subdirectory), `cargo check` for Rust (root or `src-tauri/` nested crate), `go vet ./...` for Go, `dotnet build` for C#/.NET, or `compileall` for Python (runs all that match). A cheap post-edit sanity pass — call it after a batch of edits to catch syntax and type errors before running the app. The command is fixed and takes no arguments, so it runs without prompting; results are capped like run_command. For languages with no compiler-style checker it says so instead of guessing. Takes no arguments.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {}
@@ -310,11 +298,11 @@ description: "Search the user's markdown notes by keyword — their written mate
 
             Tool {
                 name: "run_command".into(),
-                description: format!("Execute build tools, test suites, package managers, or long-running services in the current project (e.g. 'cargo test', 'npm run build', 'python app.py'). Times out after {COMMAND_TIMEOUT_SECS}s by default; pass 'timeout' up to 600s for release builds. For long-running servers or watchers, pass 'background: true' — it spawns detached and waits up to 'wait_ms' (default 2000) so you see startup logs in 1 turn. Exclusively for compilation and execution — do not use for searching or reading code (native search and read tools are pre-indexed and structured). EXACTLY ONE of two forms: 'command' (a shell string) or 'argv' (program + args as an array). The user reviews the exact command and folder and approves before it runs. Returns the exit code plus stdout/stderr."),
+                description: format!("Execute build tools, test suites, package managers, git commands, or long-running services in the current project (e.g. 'cargo test', 'npm run build', 'git log -n 5', 'python app.py'). Times out after {COMMAND_TIMEOUT_SECS}s by default; pass 'timeout' up to 600s for release builds. For long-running servers or watchers, pass 'background: true' — it spawns detached and waits up to 'wait_ms' (default 2000) so you see startup logs in 1 turn. Exclusively for compilation, git, and execution — do not use for searching or reading code (native search and read tools are pre-indexed and structured). EXACTLY ONE of two forms: 'command' (a shell string) or 'argv' (program + args as an array). Read-only git inspection ('git status', 'git log', 'git diff', 'git show', 'git blame') auto-approves without prompting; other commands are reviewed by the user before running. Returns the exit code plus stdout/stderr."),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "command": { "type": "string", "description": "Shell command string, e.g. 'pytest -q', 'cargo test', or 'npm run dev'. Executed via PowerShell on Windows (so unix aliases like ls, rm, cat work)." },
+                        "command": { "type": "string", "description": "Shell command string, e.g. 'pytest -q', 'cargo test', or 'npm run dev'. Executed via PowerShell on Windows." },
                         "argv": { "type": "array", "items": { "type": "string" }, "description": "Program + args as an array, e.g. ['git', 'commit', '-m', 'message with spaces']. Spawns directly, no shell — spaces, quotes and special chars in args are safe." },
                         "cwd": { "type": "string", "description": "Optional relative subdirectory (within the project) to run in. Defaults to the project root." },
                         "timeout": { "type": "integer", "description": "Optional timeout in seconds for synchronous commands (default 120, max 600). Raise for large test suites, release builds, or compilations." },
@@ -428,13 +416,17 @@ mod tests {
         assert!(proc_mgmt.parameters["properties"]["id"].is_object());
         assert!(proc_mgmt.parameters["properties"]["wait_seconds"].is_object());
 
-        // Verify retired 5 tools are no longer in definitions
-        for retired in ["process_start", "process_wait", "process_logs", "process_list", "process_stop"] {
+        // Verify retired tools are no longer in definitions
+        for retired in ["process_start", "process_wait", "process_logs", "process_list", "process_stop", "read_file_lines"] {
             assert!(
                 !defs.iter().any(|t| t.name == retired),
                 "retired tool '{retired}' should not be in model definitions"
             );
         }
+
+        let read_file = defs.iter().find(|t| t.name == "read_file").expect("read_file exists");
+        assert!(read_file.parameters["properties"]["start"].is_object(), "read_file should declare start");
+        assert!(read_file.parameters["properties"]["lines"].is_object(), "read_file should declare lines");
     }
 
 

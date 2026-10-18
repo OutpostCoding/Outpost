@@ -302,11 +302,51 @@ impl Store {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO threads (title, config, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
-            params![format!("{title} (copy)"), config, now],
+
+        let copied_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM messages WHERE thread_id = ?1 AND ord < ?2",
+            params![thread_id, up_to],
+            |r| r.get(0),
         )?;
-        let new_id = tx.last_insert_rowid();
+
+        let mut final_config = config;
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&final_config) {
+            let should_strip_compaction = v
+                .get("compaction")
+                .and_then(|c| c.get("up_to"))
+                .and_then(|u| u.as_i64())
+                .map_or(false, |compaction_up_to| compaction_up_to > copied_count);
+            if should_strip_compaction {
+                if let Some(obj) = v.as_object_mut() {
+                    obj.remove("compaction");
+                    if let Ok(serialized) = serde_json::to_string(&v) {
+                        final_config = serialized;
+                    }
+                }
+            }
+        }
+
+        let prev_max: i64 = tx
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'max_thread_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let table_max: i64 = tx
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM threads", [], |r| r.get(0))
+            .unwrap_or(0);
+        let new_id = prev_max.max(table_max) + 1;
+
+        tx.execute(
+            "INSERT INTO threads (id, title, config, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![new_id, format!("{title} (copy)"), final_config, now],
+        )?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('max_thread_id', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![new_id],
+        )?;
         tx.execute(
             "INSERT INTO messages
              (thread_id, ord, role, content, tool_calls, tool_call_id, created_at, reasoning, sources, segments, images)
@@ -439,6 +479,52 @@ mod id_tests {
             let d = s.create_thread("after reopen").unwrap();
             assert!(d > b + 1, "reopening reissued an id ({d}) at or below {}", b + 1);
         }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn duplicate_thread_advances_max_id_and_strips_invalid_compaction() {
+        let p = path("dup");
+        let s = Store::open_for_test(&p);
+        let t1 = s.create_thread("parent").unwrap();
+        let t2 = s.create_thread("to_purge").unwrap();
+        assert!(t2 > t1);
+        s.purge_thread(t2).unwrap();
+
+        // Save a config on t1 with compaction up_to: 5
+        let cfg = serde_json::json!({
+            "compaction": {
+                "summary": "Handover note",
+                "up_to": 5
+            }
+        });
+        s.save_config(t1, &cfg.to_string()).unwrap();
+
+        // Insert 3 messages for t1 (ord 0, 1, 2)
+        {
+            let conn = s.conn.lock();
+            for ord in 0..3 {
+                conn.execute(
+                    "INSERT INTO messages (thread_id, ord, role, content, created_at) VALUES (?1, ?2, 'user', 'msg', ?3)",
+                    params![t1, ord, now_millis()],
+                ).unwrap();
+            }
+        }
+
+        // Duplicate t1 with up_to = 2 (copies 2 messages, ord 0 and 1)
+        let dup_id = s.duplicate_thread(t1, 2).unwrap();
+        // ID must be strictly greater than t2 (the purged thread)
+        assert!(dup_id > t2, "duplicate_thread should advance past purged id {t2}, got {dup_id}");
+
+        // Next create_thread should allocate dup_id + 1 without primary key error
+        let next_id = s.create_thread("next").unwrap();
+        assert_eq!(next_id, dup_id + 1);
+
+        // Check that duplicated thread had invalid compaction stripped (since copied 2 < compaction.up_to 5)
+        let dup_cfg_str = s.load_config(dup_id).unwrap();
+        let dup_cfg: serde_json::Value = serde_json::from_str(&dup_cfg_str).unwrap();
+        assert!(dup_cfg.get("compaction").is_none(), "compaction should be stripped when branch point precedes boundary");
+
         let _ = std::fs::remove_file(&p);
     }
 }

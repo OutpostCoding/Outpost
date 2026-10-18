@@ -94,6 +94,12 @@ export function useThreadManager(initialOpts?: ThreadManagerOptions) {
   const [exportRaw, setExportRaw] = useState(false);
 
   const threadIdRef = useRef<number | null>(null);
+  const loadSeqRef = useRef(0);
+
+  const selectThreadId = useCallback((id: number | null) => {
+    threadIdRef.current = id;
+    setCurrentThreadId(id);
+  }, []);
 
   useEffect(() => {
     threadIdRef.current = currentThreadId;
@@ -141,10 +147,14 @@ export function useThreadManager(initialOpts?: ThreadManagerOptions) {
     if (busy || id === currentThreadId) return;
     setError(null);
     clearTurnState();
-    setCurrentThreadId(id);
+    selectThreadId(id);
+    const seq = ++loadSeqRef.current;
     try {
-      setMessages(await loadThread(id));
+      const msgs = await loadThread(id);
+      if (seq !== loadSeqRef.current) return;
+      setMessages(msgs);
     } catch (e) {
+      if (seq !== loadSeqRef.current) return;
       setError(`Couldn't load thread: ${e}`);
     }
   }
@@ -167,7 +177,8 @@ export function useThreadManager(initialOpts?: ThreadManagerOptions) {
         JSON.stringify({ tools: CHAT_TOOLS_DEFAULT }),
       );
       clearTurnState();
-      setCurrentThreadId(id);
+      selectThreadId(id);
+      ++loadSeqRef.current;
       setMessages([]);
       setThreads(await listThreads());
     } catch (e) {
@@ -211,7 +222,8 @@ export function useThreadManager(initialOpts?: ThreadManagerOptions) {
       );
       clearTurnState();
       setSessionRoot(root);
-      setCurrentThreadId(id);
+      selectThreadId(id);
+      ++loadSeqRef.current;
       setMessages([]);
       setThreads(await listThreads());
     } catch (e) {
@@ -282,7 +294,8 @@ export function useThreadManager(initialOpts?: ThreadManagerOptions) {
     } else {
       // No thread of that kind yet — clear to an empty state.
       clearTurnState();
-      setCurrentThreadId(null);
+      selectThreadId(null);
+      ++loadSeqRef.current;
       setMessages([]);
       setSessionRoot(null);
     }
@@ -300,8 +313,11 @@ export function useThreadManager(initialOpts?: ThreadManagerOptions) {
     try {
       const newId = await duplicateThread(id, FULL_COPY);
       clearTurnState();
-      setCurrentThreadId(newId);
-      setMessages(await loadThread(newId));
+      selectThreadId(newId);
+      const seq = ++loadSeqRef.current;
+      const msgs = await loadThread(newId);
+      if (seq !== loadSeqRef.current) return;
+      setMessages(msgs);
       setThreads(await listThreads());
     } catch (e) {
       setError(`Couldn't duplicate: ${e}`);
@@ -336,17 +352,23 @@ export function useThreadManager(initialOpts?: ThreadManagerOptions) {
         );
         if (sameKind.length > 0) {
           const next = sameKind[0];
-          setCurrentThreadId(next.id);
-          setMessages(await loadThread(next.id));
-          setSessionRoot(next.project_root ?? null);
+          selectThreadId(next.id);
+          const seq = ++loadSeqRef.current;
+          const msgs = await loadThread(next.id);
+          if (seq === loadSeqRef.current) {
+            setMessages(msgs);
+            setSessionRoot(next.project_root ?? null);
+          }
         } else if (isCode) {
           // No coding sessions left — clear to an empty, session-less state.
-          setCurrentThreadId(null);
+          selectThreadId(null);
+          ++loadSeqRef.current;
           setMessages([]);
           setSessionRoot(null);
         } else {
           const newId = await createThread();
-          setCurrentThreadId(newId);
+          selectThreadId(newId);
+          ++loadSeqRef.current;
           setMessages([]);
           setSessionRoot(null);
           ts = await listThreads();
@@ -511,6 +533,7 @@ export function useThreadManager(initialOpts?: ThreadManagerOptions) {
     setTrashed,
     currentThreadId,
     setCurrentThreadId,
+    selectThreadId,
     menuThreadId,
     setMenuThreadId,
     refreshThreads,

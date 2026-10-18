@@ -1,6 +1,6 @@
 // ── surface: code ──────────────────────────────────
 // Front end of the sandboxed Python runner — owns the Pyodide Web Worker (lazy, hard limits).
-// Exports: preloadPython, runPython · Related: coderun.rs, tools/mod.rs (run_python)
+// Exports: preloadPython, runPython, cancelPython · Related: coderun.rs, tools/mod.rs (run_python)
 
 // Front-end side of the sandboxed Python runner. Owns the Pyodide Web Worker:
 // creates it lazily, runs code with a hard timeout, and terminates+respawns it to
@@ -9,6 +9,7 @@
 
 let worker: Worker | null = null;
 let counter = 0;
+let activeCancel: (() => void) | null = null;
 
 function getWorker(): Worker {
   if (!worker) {
@@ -21,6 +22,16 @@ function getWorker(): Worker {
  *  so the initial run doesn't pay the ~1–3s warmup. */
 export function preloadPython(): void {
   getWorker();
+}
+
+/**
+ * Terminate any in-flight Python execution and reset the Pyodide worker immediately
+ * (called on turn stop or completion).
+ */
+export function cancelPython(): void {
+  if (activeCancel) {
+    activeCancel();
+  }
 }
 
 /**
@@ -38,6 +49,7 @@ export function runPython(code: string, timeoutMs = 20000): Promise<string> {
     const finish = (output: string, killWorker: boolean) => {
       if (settled) return;
       settled = true;
+      activeCancel = null;
       clearTimeout(timer);
       w.removeEventListener("message", onMessage);
       w.removeEventListener("error", onError);
@@ -50,6 +62,10 @@ export function runPython(code: string, timeoutMs = 20000): Promise<string> {
         worker = null; // respawn (and reload Pyodide) on the next run
       }
       resolve(output);
+    };
+
+    activeCancel = () => {
+      finish("Stopped by user.", true);
     };
 
     const timer = setTimeout(

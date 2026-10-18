@@ -1,5 +1,6 @@
 import React, { createContext, useContext } from "react";
 import type { ThreadInfo, NoteInfo, Compaction, ActionInfo } from "./lib/provider";
+import type { Update } from "@tauri-apps/plugin-updater";
 
 export interface ExternalFileAttachment {
   name: string;
@@ -8,6 +9,8 @@ export interface ExternalFileAttachment {
 }
 
 export interface AppContextType {
+  availableUpdate: Update | null;
+  setAvailableUpdate: React.Dispatch<React.SetStateAction<Update | null>>;
   theme: "dark" | "light";
   setTheme: (t: "dark" | "light") => void;
   editMessages: boolean;
@@ -17,8 +20,6 @@ export interface AppContextType {
 
   maxToolCalls: string;
   setMaxToolCalls: (v: string) => void;
-  sequentialToolCalls: boolean;
-  setSequentialToolCalls: (v: boolean) => void;
   readPruneTurns: number | null;
   setReadPruneTurns: (v: number | null) => void;
   permAutoWrites: boolean;

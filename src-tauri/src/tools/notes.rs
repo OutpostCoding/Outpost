@@ -13,6 +13,7 @@ impl Tools {
         &self,
         arguments: &str,
         context_files: &[String],
+        seen_paths: &[String],
         on_event: &Channel<StreamEvent>,
     ) -> String {
         if let Some(msg) = empty_args_error(arguments, "md_write", "'path' and 'content'") {
@@ -21,7 +22,7 @@ impl Tools {
         let parsed = serde_json::from_str::<Value>(arguments).ok();
         let path = parsed.as_ref().and_then(|v| arg_str(v, PATH_ALIASES));
         let content = parsed.as_ref().and_then(|v| arg_str(v, CONTENT_ALIASES));
-        let (Some(path), Some(content)) = (path, content) else {
+        let (Some(raw_path), Some(content)) = (path, content) else {
             eprintln!(
                 "[md_write] BAD ARGS ({} bytes): {}",
                 arguments.len(),
@@ -29,6 +30,8 @@ impl Tools {
             );
             return "error: md_write requires 'path' and 'content' string arguments".into();
         };
+        let normalized = normalize_md_path(raw_path);
+        let path = normalized.as_str();
         eprintln!("[md_write] path={path:?}, content={} bytes", content.len());
 
         // Sandbox to the notes root (see `sandbox::contain` — a lexical
@@ -44,9 +47,11 @@ impl Tools {
         };
 
         // Collision protection: if the target exists but isn't a document the model
-        // is aware of (in context), a same-name write is likely an accidental clash
-        // — write to a numbered variant instead of clobbering the existing file.
-        let rel = if target.exists() && !context_files.iter().any(|f| f == path) {
+        // is aware of (in context or previously touched this turn), a same-name write
+        // is likely an accidental clash — write to a numbered variant instead of clobbering.
+        let is_known = context_files.iter().any(|f| f == path || normalize_md_path(f) == path)
+            || seen_paths.iter().any(|p| p == path || normalize_md_path(p) == path);
+        let rel = if target.exists() && !is_known {
             next_available_name(&self.notes_root, path)
         } else {
             path.to_string()
@@ -129,7 +134,7 @@ impl Tools {
         let path = parsed.as_ref().and_then(|v| arg_str(v, PATH_ALIASES));
         let old = parsed.as_ref().and_then(|v| arg_str(v, OLD_ALIASES));
         let new = parsed.as_ref().and_then(|v| arg_str(v, NEW_ALIASES));
-        let (Some(path), Some(old), Some(new)) = (path, old, new) else {
+        let (Some(raw_path), Some(old), Some(new)) = (path, old, new) else {
             return format!(
                 "error: {tool} requires 'path', 'old_string', and 'new_string' string arguments"
             );
@@ -137,6 +142,25 @@ impl Tools {
         if old.is_empty() {
             return "error: old_string must not be empty".into();
         }
+
+        let normalized_path = if tool == "md_edit" {
+            normalize_md_path(raw_path)
+        } else if tool == "html_edit" {
+            let lower = raw_path.to_ascii_lowercase();
+            if !lower.ends_with(".html")
+                && !lower.ends_with(".htm")
+                && !crate::sandbox::contain(&self.notes_root, raw_path)
+                    .map(|p| p.exists())
+                    .unwrap_or(false)
+            {
+                format!("{raw_path}.html")
+            } else {
+                raw_path.to_string()
+            }
+        } else {
+            raw_path.to_string()
+        };
+        let path = normalized_path.as_str();
 
         // Sandbox to the notes root (see `sandbox::contain`).
         let full = match crate::sandbox::contain(&self.notes_root, path) {
@@ -157,7 +181,7 @@ impl Tools {
         let (updated, matched) = resolve_snippet_edit(&current, &old, &new);
         let matched_fuzzy = match matched {
             SnippetMatch::Exact => false,
-            SnippetMatch::Fuzzy => true,
+            SnippetMatch::Fuzzy { .. } | SnippetMatch::Approximate { .. } => true,
             SnippetMatch::Ambiguous(n) => {
                 return format!(
                     "error: old_string appears {n} times in '{path}' (counting whitespace-insensitive matches) — include more surrounding context so it matches exactly once, or use {} to rewrite the file.",
@@ -447,10 +471,7 @@ impl Tools {
 
     /// Resolve a note's relative path to its absolute path (sandboxed).
     pub fn note_full_path(&self, name: &str) -> Result<PathBuf, String> {
-        let trimmed = name.trim();
-        let clean = trimmed.trim_start_matches(['/', '\\']);
-        crate::sandbox::contain(&self.notes_root, clean)
-            .map_err(|why| format!("invalid note path '{}' — {why}", trimmed))
+        resolve_note_path(&self.notes_root, name)
     }
 
     /// Delete a note from the notes folder (sandboxed).
@@ -600,4 +621,64 @@ fn collect_files_bounded(
     }
 }
 
+pub(crate) fn normalize_md_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    if trimmed.to_lowercase().ends_with(".md") {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}.md")
+    }
+}
 
+pub(crate) fn resolve_note_path(notes_root: &Path, name: &str) -> Result<PathBuf, String> {
+    let trimmed = name.trim();
+    let clean = trimmed.trim_start_matches(['/', '\\']);
+    let full = crate::sandbox::contain(notes_root, clean)
+        .map_err(|why| format!("invalid note path '{}' — {why}", trimmed))?;
+    if !full.exists() && Path::new(clean).extension().is_none() {
+        let with_md = format!("{clean}.md");
+        if let Ok(p_md) = crate::sandbox::contain(notes_root, &with_md) {
+            if p_md.exists() {
+                return Ok(p_md);
+            }
+        }
+    }
+    Ok(full)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_md_path() {
+        assert_eq!(normalize_md_path("notes/summary"), "notes/summary.md");
+        assert_eq!(normalize_md_path("notes/summary.md"), "notes/summary.md");
+        assert_eq!(normalize_md_path("notes/summary.MD"), "notes/summary.MD");
+        assert_eq!(normalize_md_path("  overview  "), "overview.md");
+        assert_eq!(normalize_md_path(""), "");
+    }
+
+    #[test]
+    fn test_resolve_note_path_falls_back_to_md() {
+        let temp = std::env::temp_dir().join(format!("note_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        std::fs::write(temp.join("guide.md"), "# Guide").unwrap();
+        std::fs::write(temp.join("custom"), "custom").unwrap();
+
+        let resolved_fallback = resolve_note_path(&temp, "guide").unwrap();
+        assert_eq!(resolved_fallback, temp.join("guide.md"));
+
+        let resolved_direct = resolve_note_path(&temp, "custom").unwrap();
+        assert_eq!(resolved_direct, temp.join("custom"));
+
+        let resolved_nonexistent = resolve_note_path(&temp, "nonexistent").unwrap();
+        assert_eq!(resolved_nonexistent, temp.join("nonexistent"));
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+}

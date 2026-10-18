@@ -1322,8 +1322,20 @@ impl ContentVectorCache {
         }
     }
 
-    fn get(&self, hash: u64) -> Option<&Vec<f32>> {
-        self.entries.get(&hash)
+    fn contains(&self, hash: u64) -> bool {
+        self.entries.contains_key(&hash)
+    }
+
+    fn get(&mut self, hash: u64) -> Option<&Vec<f32>> {
+        if self.entries.contains_key(&hash) {
+            if let Some(pos) = self.order.iter().position(|&h| h == hash) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(hash);
+            self.entries.get(&hash)
+        } else {
+            None
+        }
     }
 
     fn insert(&mut self, hash: u64, vec: Vec<f32>) {
@@ -1396,6 +1408,8 @@ fn hydrate_locked(cache: &mut ContentVectorCache, root: &Path, cache_dir: Option
     if cache.loaded_root.as_deref() == Some(key.as_str()) {
         return; // already hydrated for this repo this process
     }
+    cache.entries.clear();
+    cache.order.clear();
     if let Some(vectors) = load_index(&path) {
         for (h, vec) in vectors {
             cache.insert(h, vec);
@@ -1413,9 +1427,9 @@ fn persist_index(cache: &ContentVectorCache, root: &Path, cache_dir: Option<&Pat
         return;
     };
     let vectors: Vec<(u64, Vec<f32>)> = cache
-        .entries
+        .order
         .iter()
-        .map(|(&k, v)| (k, v.clone()))
+        .filter_map(|h| cache.entries.get(h).map(|v| (*h, v.clone())))
         .collect();
     let persisted = PersistedIndex {
         model: MODEL_KEY.to_string(),
@@ -1741,7 +1755,7 @@ fn search_with(
             let mut cold = HashSet::new();
             for &idx in &embeddable_indices {
                 let h = fnv1a64(indexed[idx].chunk.text.as_bytes());
-                if cache.as_ref().map(|c| c.get(h).is_some()).unwrap_or(false) {
+                if cache.as_ref().map(|c| c.contains(h)).unwrap_or(false) {
                     warm.push(idx);
                 } else {
                     cold.insert(idx);
@@ -1846,7 +1860,26 @@ fn search_with(
         return format!("No relevant matches for '{query}'.{hint}{tip}");
     }
 
-    let shown = final_ranked.len().min(max_results);
+    let top_score = final_ranked.first().map(|(s, _)| *s).unwrap_or(0.0);
+    let mut shown = final_ranked.len().min(max_results);
+    let allow_deep_tail = parsed.as_ref().and_then(|v| v.get("max_results")).is_some() && max_results > 10;
+    let mut score_cliff_applied = false;
+    if top_score > 0.0 && shown > 1 && !allow_deep_tail {
+        let cutoff = top_score * 0.35;
+        let mut filtered_len = 0;
+        for (i, &(s, _)) in final_ranked.iter().take(shown).enumerate() {
+            if i < 1 || s >= cutoff {
+                filtered_len += 1;
+            } else {
+                break;
+            }
+        }
+        if filtered_len < shown {
+            shown = filtered_len;
+            score_cliff_applied = true;
+        }
+    }
+
     let mut out: Vec<String> = Vec::new();
     let mut line_count = 0usize;
     for &(_, idx) in &final_ranked[..shown] {
@@ -1871,10 +1904,17 @@ fn search_with(
     }
     let mut s = out.join("\n");
     if final_ranked.len() > shown {
-        s.push_str(&format!(
-            "\n… ({} relevant chunks; showing the top {shown})",
-            final_ranked.len()
-        ));
+        if score_cliff_applied {
+            s.push_str(&format!(
+                "\n… ({} matches found; showing the top {shown} above relevance threshold)",
+                final_ranked.len()
+            ));
+        } else {
+            s.push_str(&format!(
+                "\n… ({} relevant chunks; showing the top {shown})",
+                final_ranked.len()
+            ));
+        }
     }
     if let Some(note) = arm_note {
         s.push_str(&format!("\n({note})"));
@@ -2101,6 +2141,27 @@ mod tests {
         }
         let out = code_search(r#"{"query":"needle","max_results":2}"#, p.0.as_path());
         assert!(out.contains("showing the top 2"), "cap note:\n{out}");
+    }
+
+    #[test]
+    fn score_cliff_suppresses_trailing_low_relevance_chunks() {
+        let p = Proj::new("score_cliff");
+        p.write("auth.rs", "fn authenticate_user_token() {\n    verify_token();\n}\n");
+        for i in 0..5 {
+            let mut filler = String::new();
+            for j in 0..20 {
+                filler.push_str(&format!("    let var_{j} = {j};\n"));
+            }
+            p.write(&format!("filler{i}.rs"), &format!("fn filler_{i}() {{\n    let token = 123;\n{filler}}}\n"));
+        }
+        let out = code_search(r#"{"query":"authenticate user token"}"#, p.0.as_path());
+        assert!(out.contains("auth.rs"), "strong hit must be present:\n{out}");
+        assert!(!out.contains("filler4.rs"), "trailing low-relevance chaff must be suppressed:\n{out}");
+        assert!(out.contains("above relevance threshold"), "relevance cutoff note:\n{out}");
+
+        // Explicit max_results > 10 disables cliff cutoff for callers requesting breadth
+        let out_breadth = code_search(r#"{"query":"authenticate user token","max_results":15}"#, p.0.as_path());
+        assert!(out_breadth.contains("filler4.rs"), "explicit breadth query includes tail:\n{out_breadth}");
     }
 
     #[test]
@@ -2766,7 +2827,7 @@ mod tests {
             let mut c = std::collections::HashSet::new();
             for (idx, ic) in indexed.iter().enumerate() {
                 let h = super::fnv1a64(ic.chunk.text.as_bytes());
-                if cache.get(h).is_some() {
+                if cache.contains(h) {
                     w.push(idx);
                 } else {
                     c.insert(idx);
@@ -2808,7 +2869,7 @@ mod tests {
             let mut c = std::collections::HashSet::new();
             for (idx, ic) in indexed.iter().enumerate() {
                 let h = super::fnv1a64(ic.chunk.text.as_bytes());
-                if cache.get(h).is_some() {
+                if cache.contains(h) {
                     w.push(idx);
                 } else {
                     c.insert(idx);
@@ -2875,5 +2936,53 @@ mod tests {
         assert_eq!(super::format_size(0), "0 B");
         assert_eq!(super::format_size(1024 * 1024 * 50), "50.0 MB");
         assert_eq!(super::format_size(1024 * 1024 * 1024 * 2), "2.00 GB");
+    }
+
+    #[test]
+    fn hydrate_clears_vectors_when_switching_roots() {
+        let mut cache = super::ContentVectorCache::new();
+        cache.insert(42, vec![1.0, 2.0, 3.0]);
+        cache.loaded_root = Some("repo_a".to_string());
+
+        let temp = Proj::new("hydrate_switch");
+        let cache_dir = temp.0.join("cache");
+        let repo_b = temp.0.join("repo_b");
+        fs::create_dir_all(&repo_b).unwrap();
+
+        // Hydrating for repo_b should clear repo_a's vectors
+        super::hydrate_locked(&mut cache, &repo_b, Some(&cache_dir));
+        assert!(cache.get(42).is_none(), "vectors from previous root must be cleared");
+        assert_eq!(cache.entries.len(), 0);
+        assert_eq!(cache.order.len(), 0);
+        assert!(cache.loaded_root.is_some());
+    }
+
+    #[test]
+    fn lru_order_is_promoted_on_get_and_preserved_on_disk() {
+        let mut cache = super::ContentVectorCache::new();
+        cache.insert(1, vec![1.0]);
+        cache.insert(2, vec![2.0]);
+        cache.insert(3, vec![3.0]);
+        assert_eq!(cache.order.iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        // Accessing 1 moves it to the back (most recently used)
+        let _ = cache.get(1);
+        assert_eq!(cache.order.iter().copied().collect::<Vec<_>>(), vec![2, 3, 1]);
+
+        // Persist to disk and hydrate into a fresh cache
+        let temp = Proj::new("lru_persist");
+        let cache_dir = temp.0.join("cache");
+        let repo = temp.0.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+
+        super::persist_index(&cache, &repo, Some(&cache_dir));
+
+        let mut fresh = super::ContentVectorCache::new();
+        super::hydrate_locked(&mut fresh, &repo, Some(&cache_dir));
+
+        // Hydrated cache must preserve the exact same LRU order: [2, 3, 1]
+        assert_eq!(fresh.order.iter().copied().collect::<Vec<_>>(), vec![2, 3, 1]);
+        assert_eq!(fresh.get(2), Some(&vec![2.0]));
+        assert_eq!(fresh.order.iter().copied().collect::<Vec<_>>(), vec![3, 1, 2]);
     }
 }

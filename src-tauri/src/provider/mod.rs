@@ -9,6 +9,7 @@
 
 pub mod anthropic;
 pub mod engine_error;
+pub mod gemini;
 pub mod lmstudio;
 
 use std::pin::Pin;
@@ -43,7 +44,12 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
+    /// Provider-specific extensions (e.g. Google Gemini's `extra_content` housing
+    /// `thought_signature`, required to round-trip back across multi-turn tool loops).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_content: Option<serde_json::Value>,
 }
+
 
 /// A search/fetch the model performed during a turn — surfaced under the reply
 /// as a lightweight "sources" trail. UI metadata; never sent back to the model.
@@ -145,11 +151,6 @@ pub struct ChatRequest {
     /// `thinking_effort` directly and ignores this.
     #[serde(default)]
     pub reasoning_style: Option<String>,
-    /// Whether to enforce sequential single-tool execution per generation round.
-    /// When true, the provider halts generation upon detecting a second tool call,
-    /// returning only the first completed call to enforce a serial Observe -> Act loop.
-    #[serde(default)]
-    pub sequential_tool_calls: Option<bool>,
 }
 
 /// Normalized streaming events. Both backends are translated into this one shape
@@ -162,6 +163,11 @@ pub enum StreamEvent {
     /// A chunk of the model's reasoning/thinking, surfaced separately from the
     /// answer (an inline `<think>` block or an OpenAI `reasoning_content` delta).
     Reasoning { text: String },
+    /// Prefilled `<think>` closure: the model's prompt template opened `<think>`
+    /// before generation began, and an unmatched closing `</think>` tag just arrived.
+    /// All `Delta` text emitted so far in the current generation step was actually
+    /// reasoning and is promoted into the reasoning block.
+    PromoteToReasoning,
     /// Anthropic only: the signature of the just-finished thinking block. Consumed
     /// by the agent loop (stored on the assistant turn for tool-use replay); not
     /// forwarded to the UI.
@@ -264,10 +270,14 @@ pub trait Provider: Send + Sync {
 /// doing prompt processing, and cutting that off would break the case this app
 /// exists for. Stop is what covers the rest, which is why the initial call is
 /// inside the cancellation select in `run_turn`.
+///
+/// `pool_idle_timeout(15s)` closes idle pooled sockets before reverse proxies or
+/// API aggregators (Cloudflare, Nginx, OneAPI) half-close them during user think time.
 pub fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(20))
         .tcp_keepalive(std::time::Duration::from_secs(15))
+        .pool_idle_timeout(std::time::Duration::from_secs(15))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -486,9 +496,9 @@ pub fn wire_dump(system_prefix: Option<&str>, turns: &[serde_json::Value]) {
 }
 
 /// Construct a provider for a connection. `kind` selects the wire format —
-/// "anthropic" for the native Messages adapter, anything else for the
-/// OpenAI-compatible adapter (LM Studio, Mistral, Gemini's OpenAI endpoint,
-/// Mercury, OpenRouter, custom). `base_url` + optional `api_key` configure it.
+/// "anthropic" for the native Claude Messages adapter, "gemini" for the native
+/// Google GenAI REST API adapter, and anything else for the OpenAI-compatible adapter
+/// (LM Studio, Mistral, Mercury, OpenRouter, custom). `base_url` + optional `api_key` configure it.
 /// `mid_system_tail` is OBSOLETE (2026-08-30): the per-turn tail folds into
 /// the single leading system block on every adapter and every model, so the
 /// in-array capability flag is no longer consulted anywhere. Kept so the
@@ -505,6 +515,10 @@ pub fn make_provider(
             base_url,
             api_key.unwrap_or_default(),
             mid_system_tail,
+        )),
+        "gemini" => Arc::new(gemini::GeminiProvider::new(
+            base_url,
+            api_key.unwrap_or_default(),
         )),
         _ => Arc::new(lmstudio::LmStudioProvider::new(base_url, api_key)),
     }

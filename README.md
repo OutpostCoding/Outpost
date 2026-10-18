@@ -57,15 +57,15 @@ Rooted in an active project directory on disk. The model can inspect codebases, 
 
 * **Where Files Live:** Operations read and write directly to the active project folder on your Windows filesystem. All destructive file writes, edits, and deletions are automatically snapshotted for instant session rollback (`restore_file`).
 * **Core Toolset (Always On):**
-  * **Inspection:** `project_overview`, `list_dir`, `read_file`, `read_file_lines`.
+  * **Inspection:** `project_overview`, `list_dir`, `read_file` (full file or targeted `start`/`lines` ranges).
   * **Code Discovery:** `grep_search` (literal & regex search with glob filters), `code_search` (two-stage ephemeral BM25 lexical ranking + `bge-small` vector search for natural language queries), `find_symbols` (fast Tree-Sitter structural outlines).
   * **AST Code Editing:** `edit_file` (multi-tier fuzzy and anchored snippet matching with automatic indentation harmonization, symbol-scoped replacements, and pre-flight Tree-Sitter AST syntax validation across 7 languages), `write_file`.
   * **Safety & Versioning:** `delete_file`, `rename_file`, `restore_file` (session undo), `get_diff` (aggregate session changes).
   * **Native Execution:** `run_command` (native PowerShell/cmd commands, synchronous up to 600s, or background services via `background: true`), `process_manage` (inspect status/logs and terminate managed background processes).
   * **Verification:** `typecheck` (fixed `cargo check`, `tsc --noEmit`, or `compileall` validation).
-* **Elective Capabilities (Toggled via the composer's `+` menu):**
+* **Elective Capabilities (Toggled via the toolbar's `+` menu):**
   * **Web:** `web_search`, `web_fetch` (requires Tavily API key).
-  * **Vision:** `read_image`, `browser_screenshot` (hands screenshots, diagrams, and rendered pages to vision-capable models).
+  * **Vision:** `read_image`, `browser_screenshot` (hands screenshots, diagrams, and rendered pages to vision-capable models; `browser_screenshot` also requires the Browser toggle).
   * **Browser:** `browser_open`, `browser_read`, `browser_act`, `browser_reload`, `browser_close` (headless localhost browser automation to interact with running dev servers).
   * **Godot:** `godot_scene_tree` (pure text-based Godot 4 `.tscn` parser that resolves node hierarchies and properties without launching the engine).
 
@@ -85,7 +85,7 @@ Type `/` in the composer to access session commands and scaffolded thinking work
 | `/index` | Pre-compute the semantic vector search index for the active project in the background. |
 
 ### Prompt Actions & Scaffolded Skills
-Outpost includes built-in structured engineering actions (such as `/plan`, `/audit`, `/research`, `/debug`, `/commit`, `/explain`, `/perf`, `/adr`, `/grill`).
+Outpost includes built-in structured engineering actions (such as `/plan`, `/audit`, `/research`, `/debug`, `/commit`, `/explain`, `/perf`, `/adr`, `/grill`, and `/test`).
 
 You can easily add your own custom slash skills or modify existing ones:
 * **Global Actions:** Located in `%APPDATA%\com.outpost.app\actions\`. Click **Reveal Actions Folder** in the Settings modal to open this folder in Windows Explorer.
@@ -108,16 +108,17 @@ Outpost communicates through clean, normalized connection adapters configured in
 |---|---|---|---|
 | **Local** | OpenAI-compatible | `http://localhost:1234/v1` | LM Studio, Ollama, or llama.cpp (100% offline, zero network latency) |
 | **OpenRouter** | OpenAI-compatible | `https://openrouter.ai/api/v1` | Universal gateway to hundreds of open & proprietary models |
-| **Anthropic** | Native Messages | `https://api.anthropic.com` | Claude models (extended thinking / reasoning budget support) |
+| **Anthropic — Claude** | Native Messages | `https://api.anthropic.com` | Claude models (extended thinking / reasoning budget support) |
 | **OpenAI** | OpenAI-compatible | `https://api.openai.com/v1` | GPT & o-series models (reasoning effort support) |
-| **Google Gemini** | OpenAI-compatible | `https://generativelanguage.googleapis.com/v1beta/openai` | Gemini Flash & Pro series |
+| **Google Gemini** | Native GenAI | `https://generativelanguage.googleapis.com` | Gemini Flash & Pro series (native `streamGenerateContent`, live thinking & parallel tools) |
 | **xAI (Grok)** | OpenAI-compatible | `https://api.x.ai/v1` | Grok series |
 | **Mistral** | OpenAI-compatible | `https://api.mistral.ai/v1` | Mistral Large, Codestral |
 | **DeepSeek** | OpenAI-compatible | `https://api.deepseek.com/v1` | DeepSeek chat & reasoner models |
 | **Qwen (DashScope)**| OpenAI-compatible | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | Qwen Coder & reasoning models |
-| **Z.ai (GLM)** | OpenAI-compatible | `https://open.bigmodel.cn/api/paas/v4` | GLM models |
-| **Xiaomi (MiMo)** | OpenAI-compatible | `https://api.mimo.xiaomi.com/v1` | Xiaomi MiMo models |
-| **Inception AI** | OpenAI-compatible | `https://api.inception.ai/v1` | Ultra-low latency Mercury inference |
+| **Z.ai (GLM)** | OpenAI-compatible | `https://api.z.ai/api/paas/v4` | GLM models |
+| **XHToken (Horizon)** | OpenAI-compatible | `https://api.xhtoken.ai/v1` | Horizon models |
+| **Xiaomi MiMo** | Anthropic Messages | `https://api.xiaomimimo.com/anthropic` | Xiaomi MiMo models |
+| **Inception AI (Mercury)** | OpenAI-compatible | `https://api.inceptionlabs.ai/v1` | Ultra-low latency Mercury inference |
 | **Groq** | OpenAI-compatible | `https://api.groq.com/openai/v1` | Ultra-fast LPU inference (450+ tok/s) |
 | **Custom** | OpenAI-compatible | Custom URL | Any endpoint following OpenAI standard specs |
 
@@ -135,7 +136,8 @@ The following keyboard controls are active within Outpost:
 |---|---|---|
 | **Composer** | `Enter` | Send message / submit instruction |
 | **Composer** | `Shift + Enter` | Insert newline |
-| **Composer** | `Tab` or `Enter` | Accept highlighted `/` slash action or `@` file mention |
+| **Composer** | `Tab` or `Enter` | Accept highlighted `/` slash action |
+| **Composer** | `Tab` | Accept highlighted `@` file mention |
 | **Composer** | `Escape` | Dismiss active slash or mention menu |
 | **Approval Card** | `Enter` | Approve pending file change or command |
 | **Approval Card** | `Escape` | Reject pending file change or command |

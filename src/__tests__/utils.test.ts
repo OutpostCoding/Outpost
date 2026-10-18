@@ -56,6 +56,42 @@ describe("deriveTitle", () => {
     expect(deriveTitle(msgs)).toBe("file.ts");
   });
 
+  it("handles Windows backslash separators and file alias in deriveTitle", () => {
+    const msgsWindows: Message[] = [
+      {
+        role: "user",
+        content: "",
+        segments: [
+          {
+            kind: "tool",
+            id: "1",
+            name: "read_file",
+            title: "read",
+            args: JSON.stringify({ path: "src\\deep\\windows_file.ts" }),
+          },
+        ],
+      },
+    ];
+    expect(deriveTitle(msgsWindows)).toBe("windows_file.ts");
+
+    const msgsAlias: Message[] = [
+      {
+        role: "user",
+        content: "",
+        segments: [
+          {
+            kind: "tool",
+            id: "2",
+            name: "read_note",
+            title: "read",
+            args: JSON.stringify({ file: "notes\\spec.md" }),
+          },
+        ],
+      },
+    ];
+    expect(deriveTitle(msgsAlias)).toBe("spec.md");
+  });
+
   it("falls back to 'New chat' when there is nothing to derive from", () => {
     expect(deriveTitle([])).toBe("New chat");
     expect(deriveTitle([{ role: "user", content: "   " }])).toBe("New chat");
@@ -207,6 +243,14 @@ describe("toolTitle", () => {
     expect(toolTitle("project_changes", "{}")).toBe("changes this session");
     expect(toolTitle("read_image", '{"path":"ui.png"}')).toBe("read image: ui.png");
     expect(toolTitle("typecheck", "{}")).toBe("typecheck");
+    expect(toolTitle("read_file", '{"path":"src/App.tsx"}')).toBe("read: src/App.tsx");
+    expect(toolTitle("read_file", '{"path":"src/App.tsx","start":1190,"lines":60}')).toBe("read src/App.tsx (L1190–1249)");
+    expect(toolTitle("read_file_lines", '{"path":"src/App.tsx","start":1190,"lines":60}')).toBe("read src/App.tsx (L1190–1249)");
+    expect(toolTitle("read_file_lines", '{"path":"src/main.rs","offset":10,"limit":20}')).toBe("read src/main.rs (L10–29)");
+    expect(toolTitle("read_file_lines", '{"path":"src/main.rs","start":100,"end":200}')).toBe("read src/main.rs (L100–200)");
+    expect(toolTitle("read_file_lines", '{"path":"src/main.rs","start":145,"end":30}')).toBe("read src/main.rs (L145–174)");
+    expect(toolTitle("project_read_lines", '{"path":"src/main.rs"}')).toBe("read src/main.rs (L1–end)");
+    expect(toolTitle("read_file_lines", "{}")).toBe("read lines");
   });
 
   it("falls back to the bare name when args are partial mid-stream JSON", () => {
@@ -295,8 +339,8 @@ describe("loadPrefs / savePrefs", () => {
 
   it("merges partial saves into the stored prefs and writes outpost_prefs", () => {
     savePrefs({ model: "m1" });
-    savePrefs({ theme: "dark", sequentialToolCalls: true });
-    expect(loadPrefs()).toEqual({ model: "m1", theme: "dark", sequentialToolCalls: true });
+    savePrefs({ theme: "dark" });
+    expect(loadPrefs()).toEqual({ model: "m1", theme: "dark" });
     expect(localStorage.getItem("outpost_prefs")).toBeTruthy();
   });
 

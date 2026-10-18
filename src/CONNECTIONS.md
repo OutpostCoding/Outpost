@@ -1,8 +1,8 @@
 # Connections — adding & editing model providers
 
 This app reaches language models through **connections**: local (LM Studio),
-Anthropic (Claude), and any **OpenAI-compatible** API (OpenRouter, Mistral,
-Google Gemini, Mercury, Groq, DeepSeek, Together, …). This file explains how to
+Anthropic (Claude), Google Gemini (native GenAI REST API), and any **OpenAI-compatible** API
+(OpenRouter, OpenAI, xAI, Mistral, Mercury, Groq, DeepSeek, Together, …). This file explains how to
 add, remove, or change them yourself — no special tooling, just a text editor.
 
 ---
@@ -26,7 +26,7 @@ Each entry looks like this:
 |---|---|
 | `id` | A unique short id — lowercase, no spaces. **Also the name the API key is stored under** in the OS keychain, so don't reuse an id or rename it after a key is saved. |
 | `label` | The name shown in the menu. |
-| `kind` | `"openai"` for any OpenAI-compatible API (almost everything), or `"anthropic"` for Anthropic's own Claude API. |
+| `kind` | `"openai"` for any OpenAI-compatible API, `"anthropic"` for Anthropic's Claude Messages API, or `"gemini"` for Google's native GenAI REST API. |
 | `baseUrl` | The API root URL. Also editable per-connection from inside the menu. |
 | `needsKey` | `true` if the provider needs an API key; `false` for a local server (LM Studio). |
 | `ready` | `true` = selectable in the menu. (`false` greys it out — only used to stage something unfinished.) |
@@ -103,17 +103,20 @@ automatically — no manual step.
 - **`"openai"`** → the shared OpenAI-compatible adapter. Covers LM Studio plus
   virtually every hosted API. Adding these is the one-line change above.
 - **`"anthropic"`** → the dedicated Claude adapter (native Messages API, with
-  extended thinking). Use only for Anthropic's own endpoint. The per-turn tail
+  extended thinking). Use for Anthropic and compatible proxies (e.g. MiMo). The per-turn tail
   folds into the top-level `system` string on every model.
+- **`"gemini"`** → the native Google GenAI REST API adapter (`streamGenerateContent`,
+  `systemInstruction`, thinking budgets, and native function calling). Bypasses Google's
+  broken `/v1beta/openai` shim and streams thoughts directly.
 
-If you ever need a provider that is **neither** OpenAI-compatible nor Anthropic
+If you ever need a provider that is **not** covered by these adapters
 (rare — most APIs speak OpenAI's format now), that requires a new adapter in Rust:
 
 - Adapters live in `src-tauri/src/provider/` —
-  `lmstudio.rs` is the OpenAI-compatible one, `anthropic.rs` is Claude.
+  `lmstudio.rs` is the OpenAI-compatible one, `anthropic.rs` is Claude, `gemini.rs` is Google Gemini.
 - `src-tauri/src/provider/mod.rs` → the `make_provider()` function picks
   an adapter by `kind`. Add a new `kind` branch + a new adapter file there, using
-  `anthropic.rs` as a template (implement the `Provider` trait: `stream_chat` and
+  `anthropic.rs` or `gemini.rs` as a template (implement the `Provider` trait: `stream_chat` and
   `list_models`).
 
 ---
@@ -157,6 +160,13 @@ If you ever need a provider that is **neither** OpenAI-compatible nor Anthropic
 - **OpenRouter:** one key, many models, including reasoning models (DeepSeek-R1,
   Qwen-thinking) whose reasoning shows in the panel. Free (`:free`) models are
   heavily rate-limited — expect frequent `429`s.
+- **Google Gemini (native direct API):** Base URL `https://generativelanguage.googleapis.com`
+  with an AI Studio API key (`kind: "gemini"`). Outpost speaks directly to Google's native
+  `streamGenerateContent` REST API. This provides:
+  - First-class thinking support (`parts[].thought` streams live into the Thinking panel).
+  - Robust parallel tool calling with JSON object argument parsing (bypassing Google's broken `/v1beta/openai` shim).
+  - Native preservation and round-tripping of cryptographic `thoughtSignature` / `thought_signature`.
+  - Transparent normalization of legacy stored `/v1beta/openai` URLs to root API.
 
 ---
 
@@ -167,24 +177,26 @@ change over time — always trust the provider's own docs over this table.
 
 | Provider | `kind` | base URL | key? |
 |---|---|---|---|
-| local | openai | `http://localhost:1234/v1` | no |
-| Anthropic — Claude | anthropic | `https://api.anthropic.com` | yes |
-| Xiaomi MiMo | anthropic | `https://api.xiaomimimo.com/anthropic` | yes |
+| Local | openai | `http://localhost:1234/v1` | no |
 | OpenRouter | openai | `https://openrouter.ai/api/v1` | yes |
+| Anthropic — Claude | anthropic | `https://api.anthropic.com` | yes |
 | OpenAI | openai | `https://api.openai.com/v1` | yes |
+| Google Gemini | gemini | `https://generativelanguage.googleapis.com` | yes |
+| xAI (Grok) | openai | `https://api.x.ai/v1` | yes |
 | Mistral | openai | `https://api.mistral.ai/v1` | yes |
-| Google Gemini | openai | `https://generativelanguage.googleapis.com/v1beta/openai` | yes |
-| Z.ai (GLM) | openai | `https://api.z.ai/api/paas/v4` | yes |
-| Qwen (DashScope) | openai | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | yes |
 | DeepSeek | openai | `https://api.deepseek.com/v1` | yes |
+| Qwen (DashScope) | openai | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | yes |
+| Z.ai (GLM) | openai | `https://api.z.ai/api/paas/v4` | yes |
+| XHToken (Horizon) | openai | `https://api.xhtoken.ai/v1` | yes |
+| Xiaomi MiMo | anthropic | `https://api.xiaomimimo.com/anthropic` | yes |
 | Inception AI (Mercury) | openai | `https://api.inceptionlabs.ai/v1` | yes |
+| Groq | openai | `https://api.groq.com/openai/v1` | yes |
 | Custom (OpenAI-compatible) | openai | *(blank — you fill it in)* | yes |
 
 A few common extras you might add (verify the current URL in their docs):
 
 | Provider | base URL |
 |---|---|
-| Groq | `https://api.groq.com/openai/v1` |
 | Together AI | `https://api.together.xyz/v1` |
 | Fireworks | `https://api.fireworks.ai/inference/v1` |
 | Ollama (local) | `http://localhost:11434/v1` |

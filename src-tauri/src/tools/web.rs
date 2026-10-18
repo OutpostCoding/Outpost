@@ -309,22 +309,38 @@ return{url:location.href,title:document.title,text:t,logs:logs,interactables:int
             None => return "error: missing or invalid 'id'.".into(),
         };
         let action = match v.get("action").and_then(|a| a.as_str()) {
-            Some(a) => a.to_string(),
+            Some(a) => a,
             None => return "error: missing or invalid 'action'.".into(),
         };
+        let action_trimmed = action.trim();
+        if !matches!(action_trimmed, "click" | "type" | "clear" | "select") {
+            return format!(
+                "error: unknown action '{}' — use click, type, clear, or select",
+                action_trimmed
+            );
+        }
+        let act_lit = serde_json::to_string(action_trimmed).unwrap_or_else(|_| "\"\"".into());
         let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
         let text_json = serde_json::to_string(text).unwrap_or("\"\"".to_string());
 
         let js = format!(r#"(function(){{try{{
             var el = document.querySelector('[data-perc-id="{id}"]');
             if(!el) return "error: element [{id}] not found (did you run browser_read recently?)";
-            var act = "{action}";
+            var act = {act_lit};
             var txt = {text_json};
             var setNativeValue = function(element, val) {{
-                var proto = element.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-                var setter = Object.getOwnPropertyDescriptor(proto, 'value');
-                if (setter && setter.set) {{
-                    setter.set.call(element, val);
+                var proto = element instanceof window.HTMLTextAreaElement
+                    ? window.HTMLTextAreaElement.prototype
+                    : element instanceof window.HTMLInputElement
+                    ? window.HTMLInputElement.prototype
+                    : element instanceof window.HTMLSelectElement
+                    ? window.HTMLSelectElement.prototype
+                    : null;
+                var valueSetter = proto && Object.getOwnPropertyDescriptor(proto, 'value')
+                    ? Object.getOwnPropertyDescriptor(proto, 'value').set
+                    : null;
+                if (valueSetter) {{
+                    valueSetter.call(element, val);
                 }} else {{
                     element.value = val;
                 }}

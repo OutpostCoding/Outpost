@@ -29,9 +29,6 @@ export function useModelConfig(prefs0: Prefs) {
   const [maxToolCalls, setMaxToolCalls] = useState<string>(
     prefs0.maxToolCalls ?? "",
   );
-  const [sequentialToolCalls, setSequentialToolCalls] = useState<boolean>(
-    prefs0.sequentialToolCalls ?? false,
-  );
 
   const [mdWriteOn, setMdWriteOn] = useState<boolean>(prefs0.mdWriteOn ?? true);
   const [notesOn, setNotesOn] = useState<boolean>(prefs0.notesOn ?? true);
@@ -61,8 +58,6 @@ export function useModelConfig(prefs0: Prefs) {
     setMaxContext,
     maxToolCalls,
     setMaxToolCalls,
-    sequentialToolCalls,
-    setSequentialToolCalls,
     mdWriteOn,
     setMdWriteOn,
     notesOn,

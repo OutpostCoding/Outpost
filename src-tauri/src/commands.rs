@@ -79,12 +79,10 @@ pub async fn list_models(
 /// tool's own definition, and a copy here would drift from it.
 #[cfg(windows)]
 const ENV_NOTES: &str = "\n\nEnvironment — Windows (commands run through PowerShell):\n\
-     - PowerShell is used for shell commands. Use `;` to sequence commands, NOT `&&` (e.g. `cmd1; cmd2`).\n\
-     - Use standard PowerShell aliases (`ls`, `rm`, `cat`, `mv`). Variables use `$env:VAR`.\n\
-     - DO NOT use shell commands for file searching or reading. Use `code_search` as your primary discovery tool for finding features and logic, `grep_search` for exact symbols and call sites, `find_symbols` for structural outlines, and `read_file` to inspect files.\n\
+     - PowerShell is used for shell commands (tests, builds, git). Sequence commands with `;`, NOT `&&` (e.g. `cmd1; cmd2`). Use `$env:VAR` for environment variables and `curl.exe` (not `curl`) for HTTP requests.\n\
      - Python: use `py` (the launcher), NOT `python`. Check with `py --version`; install with `py -m pip install X`.\n\
      - Both stdout and stderr are captured automatically — no `2>&1` needed.\n\
-     - Python output is UTF-8 (PYTHONUTF8=1) and bytecode caching is disabled (PYTHONDONTWRITEBYTECODE=1).";
+     - Python output is UTF-8 (PYTHONUTF8=1) and bytecode caching is disabled (PYTHONDONTWRITEBYTECODE=1); git runs non-interactively (GIT_PAGER=cat, GIT_TERMINAL_PROMPT=0).";
 
 #[cfg(not(windows))]
 const ENV_NOTES: &str = "";
@@ -339,11 +337,38 @@ fn format_pruned_stub(name: &str, args: &str, raw_text: &str) -> String {
         (raw_text, false)
     };
 
-    // For `project_read_lines`, the output includes a header line:
+    // For ranged file reads (`project_read_lines`, `read_file_lines`, or `read_file` with start/lines),
+    // the output includes a header line:
     //   `'path' lines start–end (of total):`
     // followed by lines formatted as `<lineno>\t<content>`.
     // Counting only numbered lines avoids the +1 off-by-one error on ranged reads.
-    let line_count = if name == "project_read_lines" {
+    let has_range_args = parsed.as_ref().map_or(false, |v| {
+        crate::tools::parse_line_num(
+            v,
+            &[
+                "start",
+                "start_line",
+                "from",
+                "line_start",
+                "offset",
+                "lines",
+                "limit",
+                "count",
+                "num_lines",
+                "max_lines",
+                "length",
+                "end",
+                "end_line",
+                "to",
+                "line_end",
+            ],
+        )
+        .is_some()
+    });
+    let is_ranged_read = matches!(name, "read_file_lines" | "project_read_lines")
+        || (matches!(name, "read_file" | "project_read") && has_range_args);
+
+    let line_count = if is_ranged_read {
         let numbered_count = effective_text
             .lines()
             .filter(|l| {
@@ -440,8 +465,8 @@ fn format_pruned_stub(name: &str, args: &str, raw_text: &str) -> String {
                 lines.join("\n")
             }
         }
-        "read_file" | "project_read" => {
-            let path = parsed.as_ref().and_then(|v| v.get("path").and_then(|p| p.as_str()));
+        "read_file" | "project_read" if !is_ranged_read => {
+            let path = parsed.as_ref().and_then(|v| crate::tools::arg_str(v, crate::tools::PATH_ALIASES));
             let count_label = if is_truncated {
                 let total_from_trailer = raw_text
                     .rfind("\n\n[content truncated at ")
@@ -462,15 +487,15 @@ fn format_pruned_stub(name: &str, args: &str, raw_text: &str) -> String {
             } else {
                 lines_str
             };
-            let lines_tool = if name == "read_file" { "read_file_lines" } else { "project_read_lines" };
+            let reread_tool = if name == "read_file" { "read_file" } else { "project_read_lines" };
             if let Some(path) = path {
-                format!("receipt — {name}(\"{path}\") returned {count_label} in an earlier turn; the transcript's copy has since been archived (re-read with {lines_tool} before editing)")
+                format!("receipt — {name}(\"{path}\") returned {count_label} in an earlier turn; the transcript's copy has since been archived (re-read with {reread_tool} before editing)")
             } else {
-                format!("receipt — {name} returned {count_label} in an earlier turn; the transcript's copy has since been archived (re-read with {lines_tool} before editing)")
+                format!("receipt — {name} returned {count_label} in an earlier turn; the transcript's copy has since been archived (re-read with {reread_tool} before editing)")
             }
         }
-        "read_file_lines" | "project_read_lines" => {
-            let path = parsed.as_ref().and_then(|v| v.get("path").and_then(|p| p.as_str()));
+        "read_file" | "project_read" | "read_file_lines" | "project_read_lines" => {
+            let path = parsed.as_ref().and_then(|v| crate::tools::arg_str(v, crate::tools::PATH_ALIASES));
 
             // Determine start and end lines.
             // 1. First attempt: parse line numbers directly from numbered line prefixes ("<num>\t...")
@@ -484,7 +509,7 @@ fn format_pruned_stub(name: &str, args: &str, raw_text: &str) -> String {
 
             // 2. Fallback: check arguments
             let start = first_line_num
-                .or_else(|| parse_u64_field(&parsed, &["start", "start_line", "from", "line_start"]));
+                .or_else(|| parse_u64_field(&parsed, &["start", "start_line", "from", "line_start", "offset"]));
             let end = last_line_num
                 .or_else(|| parse_u64_field(&parsed, &["end", "end_line", "to", "line_end"]));
 
@@ -508,14 +533,19 @@ fn format_pruned_stub(name: &str, args: &str, raw_text: &str) -> String {
                 lines_str
             };
 
-            if let Some(path) = path {
-                format!("receipt — {name}(\"{path}\", {range_prefix}) returned {count_label} in an earlier turn; the transcript's copy has since been archived (re-read with {name} before editing)")
+            let reread_tool = if name == "project_read" || name == "project_read_lines" {
+                "project_read_lines"
             } else {
-                format!("receipt — {name}({range_prefix}) returned {count_label} in an earlier turn; the transcript's copy has since been archived (re-read with {name} before editing)")
+                "read_file"
+            };
+            if let Some(path) = path {
+                format!("receipt — {name}(\"{path}\", {range_prefix}) returned {count_label} in an earlier turn; the transcript's copy has since been archived (re-read with {reread_tool} before editing)")
+            } else {
+                format!("receipt — {name}({range_prefix}) returned {count_label} in an earlier turn; the transcript's copy has since been archived (re-read with {reread_tool} before editing)")
             }
         }
         "read_note" => {
-            let path = parsed.as_ref().and_then(|v| v.get("path").and_then(|p| p.as_str()));
+            let path = parsed.as_ref().and_then(|v| crate::tools::arg_str(v, crate::tools::PATH_ALIASES));
             let count_label = if is_truncated {
                 format!("first {lines_str} [capped]")
             } else {
@@ -528,9 +558,7 @@ fn format_pruned_stub(name: &str, args: &str, raw_text: &str) -> String {
             }
         }
         "read_image" | "project_read_image" => {
-            let path = parsed
-                .as_ref()
-                .and_then(|v| v.get("path").or_else(|| v.get("file")).and_then(|p| p.as_str()));
+            let path = parsed.as_ref().and_then(|v| crate::tools::arg_str(v, crate::tools::PATH_ALIASES));
             if let Some(path) = path {
                 format!("receipt — {name}(\"{path}\") was inspected in an earlier turn; the image payload has since been archived")
             } else {
@@ -675,7 +703,7 @@ pub(crate) fn expand_messages_with_segments(
                 *_is_first_step = false;
             };
 
-            for seg in segs {
+            for (seg_idx, seg) in segs.iter().enumerate() {
                 let kind = seg.get("kind").and_then(|k| k.as_str()).unwrap_or("");
                 match kind {
                     "reasoning" => {
@@ -707,10 +735,18 @@ pub(crate) fn expand_messages_with_segments(
                         }
                     }
                     "tool" => {
-                        let id = seg.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
+                        let raw_id = seg.get("id").and_then(|i| i.as_str()).unwrap_or("").trim();
+                        let id = if raw_id.is_empty() {
+                            format!("call_hist_{i}_{seg_idx}")
+                        } else {
+                            raw_id.to_string()
+                        };
                         let name = seg.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
                         let args = seg.get("args").and_then(|a| a.as_str()).unwrap_or("").to_string();
-                        let raw_text = seg.get("output").and_then(|t| t.as_str()).unwrap_or("").to_string();
+                        let raw_text = match seg.get("output").and_then(|t| t.as_str()) {
+                            Some(out) => out.to_string(),
+                            None => "[tool execution was interrupted before completion]".to_string(),
+                        };
 
                         // Differentiated pruning: web and vision trimmed at 1+ turns; reads trimmed according to prune_limit (0 = unlimited).
                         let should_prune = (matches!(name.as_str(), "web_search" | "web_fetch" | "read_image" | "project_read_image" | "browser_screenshot") && turns_ago >= 1)
@@ -728,6 +764,7 @@ pub(crate) fn expand_messages_with_segments(
                             id: id.clone(),
                             name,
                             arguments: args,
+                            extra_content: seg.get("extra_content").cloned(),
                         });
 
                         pending_results.push(Message {
@@ -815,6 +852,7 @@ pub(crate) fn expand_messages_with_segments(
                 // Ordinary assistant message without tools
                 msg.reasoning = None;
                 msg.reasoning_signature = None;
+                msg.segments = None;
                 expanded.push(msg);
             }
         }
@@ -857,6 +895,9 @@ pub async fn send_chat(
     // wrong live one.
     let _guard = ResetOnDrop {
         cancel: &state.cancel,
+        approvals: Some(&state.approvals),
+        code_runs: Some(&state.code_runs),
+        tools: Some(&state.tools),
     };
 
     // Prepend one leading system message: the user's per-chat instructions (if
@@ -1041,18 +1082,77 @@ fn render_for_summary(messages: &[Message], budget: Option<usize>) -> (String, u
             Role::Tool => "TOOL RESULT",
         };
         let mut piece = String::new();
-        if !m.content.trim().is_empty() {
-            piece.push_str(&format!(
-                "### {who}\n{}\n\n",
-                clip(m.content.trim(), PER_MESSAGE)
-            ));
-        }
-        for tc in &m.tool_calls {
-            piece.push_str(&format!(
-                "### TOOL CALL: {}\n{}\n\n",
-                tc.name,
-                clip(&tc.arguments, 400)
-            ));
+        let segs_with_tools = if m.role == Role::Assistant {
+            m.segments
+                .as_ref()
+                .and_then(serde_json::Value::as_array)
+                .filter(|segs| {
+                    segs.iter()
+                        .any(|s| s.get("kind").and_then(|k| k.as_str()) == Some("tool"))
+                })
+        } else {
+            None
+        };
+
+        if let Some(segs) = segs_with_tools {
+            let mut text_seen = false;
+            for seg in segs {
+                match seg.get("kind").and_then(|k| k.as_str()).unwrap_or("") {
+                    "text" => {
+                        if let Some(t) = seg.get("text").and_then(|t| t.as_str()) {
+                            let trimmed = t.trim();
+                            if !trimmed.is_empty() {
+                                text_seen = true;
+                                piece.push_str(&format!(
+                                    "### ASSISTANT\n{}\n\n",
+                                    clip(trimmed, PER_MESSAGE)
+                                ));
+                            }
+                        }
+                    }
+                    "tool" => {
+                        let name = seg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                        let args = seg.get("args").and_then(|a| a.as_str()).unwrap_or("{}");
+                        piece.push_str(&format!(
+                            "### TOOL CALL: {}\n{}\n\n",
+                            name,
+                            clip(args, 400)
+                        ));
+                        let output = seg
+                            .get("output")
+                            .and_then(|o| o.as_str())
+                            .unwrap_or("[tool execution was interrupted before completion]");
+                        let trimmed = output.trim();
+                        if !trimmed.is_empty() {
+                            piece.push_str(&format!(
+                                "### TOOL RESULT\n{}\n\n",
+                                clip(trimmed, PER_MESSAGE)
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !text_seen && !m.content.trim().is_empty() {
+                piece.push_str(&format!(
+                    "### ASSISTANT\n{}\n\n",
+                    clip(m.content.trim(), PER_MESSAGE)
+                ));
+            }
+        } else {
+            if !m.content.trim().is_empty() {
+                piece.push_str(&format!(
+                    "### {who}\n{}\n\n",
+                    clip(m.content.trim(), PER_MESSAGE)
+                ));
+            }
+            for tc in &m.tool_calls {
+                piece.push_str(&format!(
+                    "### TOOL CALL: {}\n{}\n\n",
+                    tc.name,
+                    clip(&tc.arguments, 400)
+                ));
+            }
         }
         if piece.is_empty() {
             included += 1; // nothing to render, but it isn't "dropped" either
@@ -1111,6 +1211,9 @@ pub async fn compact_thread(
     *state.cancel.lock().unwrap() = Some(token.clone());
     let _guard = ResetOnDrop {
         cancel: &state.cancel,
+        approvals: Some(&state.approvals),
+        code_runs: Some(&state.code_runs),
+        tools: Some(&state.tools),
     };
 
     // Floor the budget so a bad caller can't reduce the transcript to nothing.
@@ -1182,7 +1285,6 @@ pub async fn compact_thread(
         // Compaction is a single call, not a tool loop.
         max_tool_calls: None,
         reasoning_style: None,
-        sequential_tool_calls: None,
     };
 
     let mut stream = tokio::select! {
@@ -1196,6 +1298,7 @@ pub async fn compact_thread(
             item = stream.next() => {
                 match item {
                     Some(StreamEvent::Delta { text }) => summary.push_str(&text),
+                    Some(StreamEvent::PromoteToReasoning) => summary.clear(),
                     Some(StreamEvent::Error { message }) => return Err(message),
                     Some(StreamEvent::Done { .. }) => break,
                     None => break,
@@ -1238,6 +1341,7 @@ mod compaction_tests {
             id: "1".into(),
             name: "project_read".into(),
             arguments: r#"{"path":"src/main.rs"}"#.into(),
+            extra_content: None,
         }];
         let (out, _) = render_for_summary(
             &[
@@ -1362,6 +1466,47 @@ mod compaction_tests {
             out.contains("message number 49"),
             "newest must survive: {out}"
         );
+    }
+
+    #[test]
+    fn unpacks_assistant_segments_with_tools_during_compaction() {
+        let mut assistant = msg(Role::Assistant, "I'll run cargo test.");
+        assistant.segments = Some(serde_json::json!([
+            { "kind": "text", "text": "I will check the project status." },
+            {
+                "kind": "tool",
+                "name": "project_run_command",
+                "args": r#"{"command":"cargo test"}"#,
+                "output": "test result: ok. 4 passed; 0 failed"
+            }
+        ]));
+        let (out, dropped) = render_for_summary(
+            &[
+                msg(Role::User, "run tests"),
+                assistant,
+            ],
+            Some(100_000),
+        );
+        assert_eq!(dropped, 0);
+        assert!(out.contains("### USER\nrun tests"), "{out}");
+        assert!(out.contains("### ASSISTANT\nI will check the project status."), "{out}");
+        assert!(out.contains("### TOOL CALL: project_run_command\n{\"command\":\"cargo test\"}"), "{out}");
+        assert!(out.contains("### TOOL RESULT\ntest result: ok. 4 passed; 0 failed"), "{out}");
+        assert!(!out.contains("I'll run cargo test."), "m.content should not duplicate segment text: {out}");
+    }
+
+    #[test]
+    fn unpacks_interrupted_tool_segment_during_compaction() {
+        let mut assistant = msg(Role::Assistant, "");
+        assistant.segments = Some(serde_json::json!([
+            {
+                "kind": "tool",
+                "name": "project_run_command",
+                "args": r#"{"command":"cargo test"}"#
+            }
+        ]));
+        let (out, _) = render_for_summary(&[assistant], Some(100_000));
+        assert!(out.contains("### TOOL RESULT\n[tool execution was interrupted before completion]"), "{out}");
     }
 }
 
@@ -1544,7 +1689,7 @@ pub async fn list_project_docs(project_root: String) -> Result<Vec<String>, Stri
 #[tauri::command]
 pub async fn read_project_doc(project_root: String, path: String) -> Result<String, String> {
     let p = project_doc_path(&project_root, &path)?;
-    std::fs::read_to_string(&p).map_err(|e| format!("couldn't read {path}: {e}"))
+    crate::tools::read_text_capped(&p)
 }
 
 /// Write one project markdown doc from the viewer (a human edit — direct).
@@ -1819,10 +1964,22 @@ pub fn reveal_models_dir(app: tauri::AppHandle) -> Result<(), String> {
 /// end of `send_chat` — i.e. exactly when the turn ends.
 struct ResetOnDrop<'a> {
     cancel: &'a Mutex<Option<CancellationToken>>,
+    approvals: Option<&'a Approvals>,
+    code_runs: Option<&'a CodeRuns>,
+    tools: Option<&'a crate::tools::Tools>,
 }
 impl Drop for ResetOnDrop<'_> {
     fn drop(&mut self) {
         *self.cancel.lock().unwrap() = None;
+        if let Some(approvals) = self.approvals {
+            approvals.clear();
+        }
+        if let Some(code_runs) = self.code_runs {
+            code_runs.clear();
+        }
+        if let Some(tools) = self.tools {
+            let _ = tools.take_pending_images();
+        }
     }
 }
 
@@ -1836,7 +1993,12 @@ mod cancel_tests {
     fn reset_on_drop_clears_the_slot() {
         let slot = Mutex::new(Some(CancellationToken::new()));
         {
-            let _guard = ResetOnDrop { cancel: &slot };
+            let _guard = ResetOnDrop {
+                cancel: &slot,
+                approvals: None,
+                code_runs: None,
+                tools: None,
+            };
             assert!(slot.lock().unwrap().is_some());
         }
         assert!(slot.lock().unwrap().is_none());
@@ -1852,6 +2014,9 @@ mod cancel_tests {
 /// turn that follows).
 #[tauri::command]
 pub fn stop_turn(state: State<'_, AppState>) -> bool {
+    state.approvals.clear();
+    state.code_runs.clear();
+    let _ = state.tools.take_pending_images();
     match state.cancel.lock().unwrap().as_ref() {
         Some(token) => {
             token.cancel();
@@ -2366,7 +2531,7 @@ pub fn preview_context(
             Role::Tool => unreachable!(),
         };
 
-        let tokens = estimate_tokens(text.trim());
+        let tokens = estimate_tokens(text.trim()) + m.images.len() * 1000;
         let display_content = text.trim().to_string();
 
         sections.push(ContextSection {
@@ -2666,6 +2831,67 @@ mod project_files_tests {
         assert!(expanded[4].tool_calls.is_empty());
         assert!(expanded[4].reasoning.is_none());
         assert!(expanded[4].reasoning_signature.is_none());
+    }
+
+    #[test]
+    fn test_expand_messages_interrupted_tool_and_fallback_id() {
+        let segs = serde_json::json!([
+            {
+                "kind": "tool",
+                "name": "cargo_check",
+                "args": "{}"
+                // missing "id" and missing "output"
+            }
+        ]);
+
+        let input = vec![
+            Message {
+                role: Role::User,
+                content: "run check".into(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                created_at: None,
+                reasoning: None,
+                reasoning_signature: None,
+                sources: Vec::new(),
+                segments: None,
+            },
+            Message {
+                role: Role::Assistant,
+                content: "".into(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                created_at: None,
+                reasoning: None,
+                reasoning_signature: None,
+                sources: Vec::new(),
+                segments: Some(segs),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "Plain message".into(),
+                images: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                created_at: None,
+                reasoning: Some("old thoughts".into()),
+                reasoning_signature: None,
+                sources: Vec::new(),
+                segments: Some(serde_json::json!([{ "kind": "text", "text": "Plain message" }])),
+            },
+        ];
+
+        let expanded = expand_messages_with_segments(input, None);
+        assert_eq!(expanded.len(), 4);
+        assert_eq!(expanded[1].tool_calls[0].id, "call_hist_1_0");
+        assert_eq!(expanded[2].role, Role::Tool);
+        assert_eq!(expanded[2].tool_call_id.as_deref(), Some("call_hist_1_0"));
+        assert_eq!(expanded[2].content, "[tool execution was interrupted before completion]");
+        assert_eq!(expanded[3].content, "Plain message");
+        assert!(expanded[3].reasoning.is_none());
+        assert!(expanded[3].segments.is_none(), "ordinary assistant message segments should be stripped");
     }
 
     #[test]
@@ -3327,7 +3553,7 @@ mod project_files_tests {
             "receipt — godot_scene_tree(\"scenes/world.tscn\") returned 250 nodes [capped] in an earlier turn; the transcript's copy has since been archived"
         );
 
-        // 15. Canonical tool names: read_file, read_file_lines, read_image
+        // 15. Canonical tool names: read_file (full & ranged), read_file_lines (legacy), read_image
         let stub_canonical_read = format_pruned_stub(
             "read_file",
             r#"{"path":"src/app.rs"}"#,
@@ -3335,7 +3561,17 @@ mod project_files_tests {
         );
         assert_eq!(
             stub_canonical_read,
-            "receipt — read_file(\"src/app.rs\") returned 5 lines in an earlier turn; the transcript's copy has since been archived (re-read with read_file_lines before editing)"
+            "receipt — read_file(\"src/app.rs\") returned 5 lines in an earlier turn; the transcript's copy has since been archived (re-read with read_file before editing)"
+        );
+
+        let stub_canonical_ranged = format_pruned_stub(
+            "read_file",
+            r#"{"path":"src/app.rs","start":10,"lines":3}"#,
+            numbered_output,
+        );
+        assert_eq!(
+            stub_canonical_ranged,
+            "receipt — read_file(\"src/app.rs\", lines 10–12) returned 3 lines in an earlier turn; the transcript's copy has since been archived (re-read with read_file before editing)"
         );
 
         let stub_canonical_lines = format_pruned_stub(
@@ -3345,7 +3581,7 @@ mod project_files_tests {
         );
         assert_eq!(
             stub_canonical_lines,
-            "receipt — read_file_lines(\"src/app.rs\", lines 10–12) returned 3 lines in an earlier turn; the transcript's copy has since been archived (re-read with read_file_lines before editing)"
+            "receipt — read_file_lines(\"src/app.rs\", lines 10–12) returned 3 lines in an earlier turn; the transcript's copy has since been archived (re-read with read_file before editing)"
         );
 
         let stub_canonical_img = format_pruned_stub(
@@ -3645,6 +3881,40 @@ mod project_files_tests {
             content,
             "[2 tool calls]\n• project_read: tetris/board.py\n• project_read: tetris/pieces.py"
         );
+    }
+
+    #[test]
+    fn test_format_pruned_stub_path_aliases() {
+        let stub = format_pruned_stub(
+            "project_read",
+            r#"{"file":"src/main.rs"}"#,
+            "fn main() {}\n",
+        );
+        assert!(stub.contains("project_read(\"src/main.rs\")"), "{stub}");
+
+        let stub_lines = format_pruned_stub(
+            "project_read_lines",
+            r#"{"filepath":"src/main.rs","start":1,"end":1}"#,
+            "1\tfn main() {}\n",
+        );
+        assert!(stub_lines.contains("project_read_lines(\"src/main.rs\", line 1)"), "{stub_lines}");
+
+        let stub_note = format_pruned_stub(
+            "read_note",
+            r#"{"filename":"notes/idea.md"}"#,
+            "hello note",
+        );
+        assert!(stub_note.contains("read_note(\"notes/idea.md\")"), "{stub_note}");
+    }
+
+    #[tokio::test]
+    async fn test_read_project_doc_rejects_directory() {
+        let temp_dir = std::env::temp_dir().join(format!("outpost_doc_dir_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(temp_dir.join("subfolder")).unwrap();
+        let res = read_project_doc(temp_dir.to_str().unwrap().to_string(), "subfolder".to_string()).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("is a directory"));
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
 

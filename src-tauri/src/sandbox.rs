@@ -100,6 +100,13 @@ pub fn contain(root: &Path, rel: &str) -> Result<PathBuf, String> {
         if let Ok(c) = std::fs::canonicalize(probe) {
             break c;
         }
+        // If `canonicalize` failed but `symlink_metadata` succeeds, `probe` is a
+        // broken/dangling symlink or junction — refuse to resolve through it.
+        if std::fs::symlink_metadata(probe).is_ok() {
+            return Err(format!(
+                "path '{rel}' resolves through a broken symlink or junction"
+            ));
+        }
         match probe.parent() {
             Some(parent) => probe = parent,
             None => return Err("the path could not be resolved".into()),
@@ -226,6 +233,39 @@ mod tests {
                 Err(_) => {}
                 Ok(p) => panic!("{rel} still escapes to {}", p.display()),
             }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dangling_symlink_or_junction_is_refused() {
+        let root = tmp("dangling_root");
+        let nonexistent_target = root.join("does_not_exist_anywhere");
+        let link = root.join("broken_link");
+
+        #[cfg(windows)]
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&nonexistent_target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+            || std::os::windows::fs::symlink_dir(&nonexistent_target, &link).is_ok();
+        #[cfg(not(windows))]
+        let made = std::os::unix::fs::symlink(&nonexistent_target, &link).is_ok();
+
+        if made {
+            assert!(
+                contain(&root, "broken_link/payload.txt").is_err(),
+                "resolving through a broken symlink must be refused"
+            );
+            assert!(
+                contain(&root, "broken_link").is_err(),
+                "resolving a broken symlink must be refused"
+            );
+            let _ = std::fs::remove_dir(&link);
+            let _ = std::fs::remove_file(&link);
         }
         let _ = std::fs::remove_dir_all(&root);
     }

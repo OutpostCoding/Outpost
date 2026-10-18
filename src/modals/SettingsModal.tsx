@@ -23,15 +23,15 @@ import { useBackdropClose } from "../hooks/useBackdropClose";
 
 const COMMAND_PALETTES = [
   {
-    id: "inspect",
-    name: "Inspection & Orientation",
+    id: "git",
+    name: "Git & Version Control",
     commands: [
-      { pattern: "git status", description: "View modified files and branch state" },
-      { pattern: "git diff", description: "View working tree changes" },
-      { pattern: "git log", description: "Inspect recent commit history" },
-      { pattern: "pwd", description: "Print current working directory" },
-      { pattern: "ls", description: "List files and directories" },
-      { pattern: "dir", description: "List files (Windows command)" },
+      { pattern: "git add", description: "Stage files for commit" },
+      { pattern: "git commit", description: "Record changes to the repository" },
+      { pattern: "git branch", description: "Create, rename, or delete branches" },
+      { pattern: "git checkout", description: "Switch branches or restore working tree files" },
+      { pattern: "git switch", description: "Switch branches" },
+      { pattern: "git stash", description: "Stash working directory changes" },
     ],
   },
   {
@@ -68,6 +68,21 @@ const COMMAND_PALETTES = [
 
 const STANDARD_PATTERNS = new Set(COMMAND_PALETTES.flatMap((c) => c.commands.map((x) => x.pattern)));
 
+// Read-only git inspection and shell orientation commands that are now handled
+// natively (auto-approved or intercepted by native tools) and shouldn't surface as custom rules.
+const BUILTIN_OR_RETIRED_PATTERNS = new Set([
+  "git status",
+  "git diff",
+  "git log",
+  "git show",
+  "git blame",
+  "git rev-parse",
+  "git ls-files",
+  "pwd",
+  "ls",
+  "dir",
+]);
+
 const INTERPRETER_TOKENS = new Set(["node", "python", "py", "python3", "deno", "bun", "ruby", "perl", "php"]);
 
 function isInterpreterPattern(pattern: string): boolean {
@@ -96,8 +111,6 @@ export function SettingsModal({
     actions,
     maxToolCalls,
     setMaxToolCalls,
-    sequentialToolCalls,
-    setSequentialToolCalls,
     readPruneTurns,
     setReadPruneTurns,
     permAutoWrites,
@@ -121,6 +134,8 @@ export function SettingsModal({
     setKeyDraft,
     saveKey,
     deleteKey,
+    availableUpdate,
+    setAvailableUpdate,
   } = useAppContext();
 
   // Updates (Tauri updater plugin): manual check here in Settings. On Windows,
@@ -130,12 +145,22 @@ export function SettingsModal({
   // during the previous render").
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
-  const [updateAvail, setUpdateAvail] = useState<Update | null>(null);
+  const [updateAvail, setUpdateAvail] = useState<Update | null>(availableUpdate);
   const [downloading, setDownloading] = useState(false);
   const [progress, setProgress] = useState<number | null>(null);
-  const [updateMsg, setUpdateMsg] = useState("");
+  const [updateMsg, setUpdateMsg] = useState(
+    availableUpdate ? `Version ${availableUpdate.version} is available.` : ""
+  );
   const backdropHandlers = useBackdropClose(onClose);
   const contentRef = useRef<HTMLDivElement>(null);
+
+  // Sync state if launch background check completes while settings is mounted
+  useEffect(() => {
+    if (availableUpdate) {
+      setUpdateAvail(availableUpdate);
+      setUpdateMsg(`Version ${availableUpdate.version} is available.`);
+    }
+  }, [availableUpdate]);
 
   // Reset scroll to top whenever the user switches settings tabs or opens the modal
   useEffect(() => {
@@ -175,20 +200,36 @@ export function SettingsModal({
   const [savedCustom, setSavedCustom] = useState<string[]>(() => {
     try {
       const raw = localStorage.getItem("outpost_custom_commands");
-      return raw ? JSON.parse(raw) : [];
-    } catch {
-      return [];
-    }
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          return parsed.filter(
+            (x) =>
+              typeof x === "string" &&
+              !STANDARD_PATTERNS.has(x) &&
+              !BUILTIN_OR_RETIRED_PATTERNS.has(x),
+          );
+        }
+      }
+    } catch {}
+    return [];
   });
   const [isManagingCustom, setIsManagingCustom] = useState(false);
 
-  // Sync any active custom commands into savedCustom so they aren't lost
+  // Synchronize any newly whitelisted non-standard commands into the persistent custom tray
   useEffect(() => {
-    const uncataloged = permWhitelist.filter((p) => !STANDARD_PATTERNS.has(p));
-    if (uncataloged.length === 0) return;
+    const uncataloged = permWhitelist.filter(
+      (p) => !STANDARD_PATTERNS.has(p) && !BUILTIN_OR_RETIRED_PATTERNS.has(p),
+    );
     setSavedCustom((prev) => {
       let changed = false;
-      const next = [...prev];
+      const next = prev.filter((p) => {
+        if (BUILTIN_OR_RETIRED_PATTERNS.has(p) || STANDARD_PATTERNS.has(p)) {
+          changed = true;
+          return false;
+        }
+        return true;
+      });
       for (const u of uncataloged) {
         if (!next.includes(u)) {
           next.push(u);
@@ -309,13 +350,16 @@ export function SettingsModal({
     setChecking(true);
     setUpdateMsg("");
     setUpdateAvail(null);
+    setAvailableUpdate(null);
     setProgress(null);
     try {
       const u = await check();
       if (u) {
         setUpdateAvail(u);
+        setAvailableUpdate(u);
         setUpdateMsg(`Version ${u.version} is available.`);
       } else {
+        setAvailableUpdate(null);
         setUpdateMsg("You're up to date.");
       }
     } catch (e) {
@@ -344,6 +388,7 @@ export function SettingsModal({
           }
         }
       });
+      setAvailableUpdate(null);
       // On Windows the app exits here; the installer relaunches it.
       setUpdateMsg("Update installed.");
     } catch (e) {
@@ -383,7 +428,13 @@ export function SettingsModal({
               className={`settings-nav-item${settingsSection === id ? " active" : ""}`}
               onClick={() => setSettingsSection(id)}
             >
-              {label}
+              <span>{label}</span>
+              {id === "updates" && availableUpdate && (
+                <span
+                  className="settings-update-dot"
+                  title={`Version ${availableUpdate.version} available`}
+                />
+              )}
             </button>
           ))}
         </aside>
@@ -530,7 +581,7 @@ export function SettingsModal({
                       <div className="settings-row-info">
                         <span className="settings-row-label">Tool calls per turn</span>
                         <span className="settings-row-hint">
-                          How many tools the model may call in one go before stopping.
+                          How many tools the model may call in one go before pausing for input. Default 40, maximum 200 (safety ceiling).
                         </span>
                       </div>
                       <div className="settings-row-control">
@@ -541,9 +592,15 @@ export function SettingsModal({
                           value={maxToolCalls}
                           spellCheck={false}
                           placeholder="40"
-                          onChange={(e) =>
-                            setMaxToolCalls(e.target.value.replace(/[^0-9]/g, ""))
-                          }
+                          onChange={(e) => {
+                            const digits = e.target.value.replace(/[^0-9]/g, "");
+                            if (!digits) {
+                              setMaxToolCalls("");
+                              return;
+                            }
+                            const val = parseInt(digits, 10);
+                            setMaxToolCalls(val > 200 ? "200" : String(val));
+                          }}
                         />
                       </div>
                     </div>
@@ -567,20 +624,6 @@ export function SettingsModal({
                           <option value={1}>1 turn (Aggressive)</option>
                           <option value={0}>Keep full (Unlimited)</option>
                         </select>
-                      </div>
-                    </div>
-                    <div className="settings-row">
-                      <div className="settings-row-info">
-                        <span className="settings-row-label">Sequential tool execution (Troubleshooting)</span>
-                        <span className="settings-row-hint">
-                          Limits local models to one tool call per turn (serial Observe → Act loop). Leave disabled for normal use so models use their trained parallel workflows; enable only for troubleshooting small setups that crash or struggle with multi-tool streaming.
-                        </span>
-                      </div>
-                      <div className="settings-row-control">
-                        <Switch
-                          checked={sequentialToolCalls}
-                          onChange={setSequentialToolCalls}
-                        />
                       </div>
                     </div>
                   </div>
@@ -718,7 +761,7 @@ export function SettingsModal({
                           )}
                         </div>
                         <span className="settings-row-hint">
-                          Commands matching a whitelisted pattern run without confirmation if they clear sandbox guards (no path escapes, no pipes or shell redirection, no blacklisted system tools). Compound commands require all segments to match.
+                          Read-only Git inspection (<code>status</code>, <code>diff</code>, <code>log</code>, <code>show</code>, <code>blame</code>) is always allowed automatically. Other commands matching a whitelisted pattern run without confirmation if they clear sandbox guards (no path escapes, no pipes or shell redirection, no blacklisted system tools). Compound commands require all segments to match.
                         </span>
                       </div>
                       <div className="settings-row-control">

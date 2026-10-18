@@ -234,6 +234,20 @@ describe("forModel — compaction substitution", () => {
     expect(out).toHaveLength(1);
     expect(out[0].role).toBe("system");
   });
+
+  it("preserves trailing user prompt even if up_to is stale after clear", () => {
+    const { result } = renderHook(() => useCompactionManager(baseOpts()));
+    act(() =>
+      result.current.setCompaction({ summary: "SUMMARY", up_to: 4, at: 0 }),
+    );
+    const out = result.current.forModel([
+      { role: "user", content: "first after clear" },
+    ]);
+    expect(out).toHaveLength(2);
+    expect(out[0].role).toBe("system");
+    expect(out[0].content).toContain("SUMMARY");
+    expect(out[1]).toEqual({ role: "user", content: "first after clear" });
+  });
 });
 
 describe("runCompaction — boundary selection", () => {

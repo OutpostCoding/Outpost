@@ -204,7 +204,10 @@ impl Tools {
         let is_enabled = enabled.iter().any(|e| {
             e == &call.name
                 || match (e.as_str(), call.name.as_str()) {
-                    ("read_file", "project_read") | ("project_read", "read_file") => true,
+                    ("read_file", "project_read")
+                    | ("project_read", "read_file")
+                    | ("read_file", "read_file_lines")
+                    | ("read_file", "project_read_lines") => true,
                     ("read_file_lines", "project_read_lines") | ("project_read_lines", "read_file_lines") => true,
                     ("read_image", "project_read_image") | ("project_read_image", "read_image") => true,
                     ("list_dir", "project_list") | ("project_list", "list_dir") => true,
@@ -245,7 +248,7 @@ impl Tools {
             "web_fetch" => self.web_fetch(&call.arguments).await,
             "run_python" => self.run_python(&call.arguments, on_event).await,
             "md_write" => {
-                self.md_write(&call.arguments, context_files, on_event)
+                self.md_write(&call.arguments, context_files, seen_paths, on_event)
                     .await
             }
             "md_edit" => self.md_edit(&call.arguments, on_event).await,

@@ -47,20 +47,27 @@ impl Tools {
                     let t_norm = trimmed.replace('\\', "/");
                     let r_norm = canon_root.to_string_lossy().replace('\\', "/");
                     let r_clean = r_norm.trim_start_matches("//?/").trim_start_matches(r"\\?\");
-                    let r_plain = root.to_string_lossy().replace('\\', "/");
-                    let t_lower = t_norm.to_lowercase();
-                    let r_clean_lower = r_clean.to_lowercase();
-                    let r_plain_lower = r_plain.to_lowercase();
-                    if t_lower.starts_with(&r_clean_lower) {
-                        t_norm
-                            .get(r_clean.len()..)
-                            .map(|s| s.trim_start_matches('/').to_string())
-                            .unwrap_or_else(|| trimmed.to_string())
-                    } else if t_lower.starts_with(&r_plain_lower) {
-                        t_norm
-                            .get(r_plain.len()..)
-                            .map(|s| s.trim_start_matches('/').to_string())
-                            .unwrap_or_else(|| trimmed.to_string())
+                    let r_clean_trimmed = r_clean.trim_end_matches('/');
+                    let r_plain_raw = root.to_string_lossy().replace('\\', "/");
+                    let r_plain = r_plain_raw.trim_end_matches('/');
+
+                    let strip_prefix = |text: &str, prefix: &str| -> Option<String> {
+                        if !prefix.is_empty()
+                            && text.len() >= prefix.len()
+                            && text.is_char_boundary(prefix.len())
+                            && text[..prefix.len()].eq_ignore_ascii_case(prefix)
+                            && (text.len() == prefix.len() || text.as_bytes()[prefix.len()] == b'/')
+                        {
+                            Some(text[prefix.len()..].trim_start_matches('/').to_string())
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(rel) = strip_prefix(&t_norm, r_clean_trimmed) {
+                        rel
+                    } else if let Some(rel) = strip_prefix(&t_norm, r_plain) {
+                        rel
                     } else {
                         trimmed.to_string()
                     }
@@ -296,8 +303,34 @@ impl Tools {
     }
 
     pub(crate) fn run_project_read(arguments: &str, root: &Path) -> String {
-        let path = serde_json::from_str::<Value>(arguments)
-            .ok()
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        if let Some(ref v) = parsed {
+            if parse_line_num(
+                v,
+                &[
+                    "start",
+                    "start_line",
+                    "from",
+                    "line_start",
+                    "offset",
+                    "lines",
+                    "limit",
+                    "count",
+                    "num_lines",
+                    "max_lines",
+                    "length",
+                    "end",
+                    "end_line",
+                    "to",
+                    "line_end",
+                ],
+            )
+            .is_some()
+            {
+                return Self::run_project_read_lines(arguments, root);
+            }
+        }
+        let path = parsed
             .as_ref()
             .and_then(|v| arg_str(v, PATH_ALIASES).map(str::to_string));
         let Some(path) = path else {
@@ -323,11 +356,11 @@ impl Tools {
                     if approx_numbered_chars <= MAX_CHARS_CEILING {
                         let suggest_cap = ((approx_numbered_chars + 999) / 1000) * 1000;
                         format!(
-                            "{numbered}\n\n[content truncated at {max_chars} chars (showing lines 1–{shown_lines} of {total_lines}; {total_chars} total chars) — pass max_chars: {suggest_cap} to read the full file, or use read_file_lines for specific ranges]"
+                            "{numbered}\n\n[content truncated at {max_chars} chars (showing lines 1–{shown_lines} of {total_lines}; {total_chars} total chars) — pass max_chars: {suggest_cap} to read the full file, or pass start and lines to read_file for specific ranges]"
                         )
                     } else {
                         format!(
-                            "{numbered}\n\n[content truncated at {max_chars} chars (showing lines 1–{shown_lines} of {total_lines}; {total_chars} total chars) — file exceeds the {MAX_CHARS_CEILING} char ceiling. Use read_file_lines to read targeted ranges or find_symbols for an outline.]"
+                            "{numbered}\n\n[content truncated at {max_chars} chars (showing lines 1–{shown_lines} of {total_lines}; {total_chars} total chars) — file exceeds the {MAX_CHARS_CEILING} char ceiling. Pass start and lines to read_file to read targeted ranges or use find_symbols for an outline.]"
                         )
                     }
                 } else {
@@ -357,20 +390,34 @@ impl Tools {
         };
         let start = parsed
             .as_ref()
-            .and_then(|v| parse_line_num(v, &["start", "start_line", "from", "line_start"]))
+            .and_then(|v| parse_line_num(v, &["start", "start_line", "from", "line_start", "offset"]))
             .unwrap_or(1)
             .max(1);
+
+        let lines_arg = parsed
+            .as_ref()
+            .and_then(|v| parse_line_num(v, &["lines", "limit", "count", "num_lines", "max_lines", "length"]));
+
         let end_arg = parsed
             .as_ref()
             .and_then(|v| parse_line_num(v, &["end", "end_line", "to", "line_end"]));
 
-        if let Some(e) = end_arg {
+        // Resolve effective end line:
+        // 1. Explicit lines/limit argument takes priority (chunk mode: start + lines - 1).
+        // 2. Legacy end argument:
+        //    - If end >= start: absolute end line (start..=end).
+        //    - If end < start: auto-heal! Model passed a relative line count as 'end' (e.g. start: 145, end: 30 -> 174).
+        let effective_end: Option<usize> = if let Some(n) = lines_arg {
+            Some(start.saturating_add(n.max(1)).saturating_sub(1))
+        } else if let Some(e) = end_arg {
             if e < start {
-                return format!(
-                    "error: end line ({e}) is before start line ({start}) for '{path}'."
-                );
+                Some(start.saturating_add(e.max(1)).saturating_sub(1))
+            } else {
+                Some(e)
             }
-        }
+        } else {
+            None
+        };
 
         let max_chars = parse_max_chars(arguments, MAX_NOTE_CHARS);
 
@@ -383,6 +430,9 @@ impl Tools {
             Ok(m) => m,
             Err(e) => return format!("error reading '{path}': {e}"),
         };
+        if meta.is_dir() {
+            return format!("error: '{path}' is a directory — use list_dir to inspect folders.");
+        }
 
         const MAX_DIRECT_BYTES: u64 = 8 * 1024 * 1024;
         if meta.len() <= MAX_DIRECT_BYTES {
@@ -398,7 +448,7 @@ impl Tools {
             if start > total {
                 return format!("'{path}' has only {total} lines; start line {start} is past the end.");
             }
-            let end = end_arg.unwrap_or(total).clamp(start, total);
+            let end = effective_end.unwrap_or(total).clamp(start, total);
             let mut numbered = String::new();
             let mut char_count = 0;
             let mut truncated = false;
@@ -464,7 +514,7 @@ impl Tools {
             if current_line < start {
                 continue;
             }
-            if let Some(end) = end_arg {
+            if let Some(end) = effective_end {
                 if current_line > end {
                     break;
                 }
@@ -1537,6 +1587,9 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
             Ok(p) => p,
             Err(e) => return format!("error: {e}"),
         };
+        if full.is_dir() {
+            return format!("error: '{path}' is a directory — project_write writes files only.");
+        }
         let current = std::fs::read_to_string(&full).unwrap_or_default();
         let content_to_write = if current.contains("\r\n") {
             match_file_endings(&current, content)
@@ -1639,11 +1692,14 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
             Ok(p) => p,
             Err(e) => return format!("error: {e}"),
         };
+        if full.is_dir() {
+            return format!("error: '{path}' is a directory — project_edit edits files only.");
+        }
         let current = match std::fs::read_to_string(&full) {
             Ok(c) => c,
             Err(_) => {
                 return format!(
-                "error: '{path}' doesn't exist or can't be read — use project_write to create it"
+                "error: '{path}' doesn't exist or can't be read — use write_file to create it"
             )
             }
         };
@@ -1660,9 +1716,26 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
                 _ => return "error: old_string must not be empty".into(),
             };
             let (u, matched) = resolve_snippet_edit(&current, old_str, new);
-            let matched_fuzzy = match matched {
-                SnippetMatch::Exact => false,
-                SnippetMatch::Fuzzy => true,
+            let note = match matched {
+                SnippetMatch::Exact => String::new(),
+                SnippetMatch::Fuzzy { start_line, end_line } => {
+                    if start_line == end_line {
+                        format!(" (replaced line {start_line}; indentation automatically harmonized)")
+                    } else {
+                        format!(" (replaced lines {start_line}–{end_line}; indentation automatically harmonized)")
+                    }
+                }
+                SnippetMatch::Approximate { start_line, end_line } => {
+                    if start_line == end_line {
+                        format!(
+                            " (replaced line {start_line} via anchor/similarity fallback; indentation automatically harmonized — verify surrounding lines)"
+                        )
+                    } else {
+                        format!(
+                            " (replaced lines {start_line}–{end_line} via anchor/similarity fallback; indentation automatically harmonized — verify surrounding lines)"
+                        )
+                    }
+                }
                 SnippetMatch::Ambiguous(n) => {
                     return format!(
                         "error: old_string appears {n} times in '{path}' (counting whitespace-insensitive matches) — include 2–3 more surrounding lines before and after so it matches uniquely."
@@ -1670,18 +1743,13 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
                 }
                 SnippetMatch::NotFound(hint) => {
                     let mut msg = format!(
-                        "error: old_string was not found in '{path}' — not even ignoring whitespace (indentation, trailing spaces, line endings, blank lines). Call project_read to check '{path}' for its current text (an earlier edit may have modified it), and retry with the exact lines from the file."
+                        "error: old_string was not found in '{path}' — not even ignoring whitespace (indentation, trailing spaces, line endings, blank lines). Call read_file to check '{path}' for its current text (an earlier edit may have modified it), and retry with the exact lines from the file."
                     );
                     if let Some(h) = hint {
                         msg.push_str(&format!("\n\nHint: {}", h));
                     }
                     return msg;
                 }
-            };
-            let note = if matched_fuzzy {
-                " (matched with whitespace-insensitive matching — indentation/spacing in the file may differ from your old_string)".to_string()
-            } else {
-                String::new()
             };
             (u, note)
         };
@@ -2113,14 +2181,65 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
         let Some(root) = project_root else {
             return "error: no project is open — typecheck needs an active coding session.".into();
         };
-        let mut checks: Vec<&str> = Vec::new();
+
+        let mut checks: Vec<TypeCheck> = Vec::new();
+
+        // --- Rust ---
+        // A root-level Cargo.toml takes priority; otherwise fall back to a
+        // Tauri layout with its crate nested under src-tauri/.
         if root.join("Cargo.toml").exists() {
-            checks.push("cargo check");
-        }
-        if root.join("tsconfig.json").exists() {
-            checks.push("npx --no-install tsc --noEmit");
+            checks.push(TypeCheck {
+                command: "cargo check".into(),
+                working_dir: root.to_path_buf(),
+            });
+        } else if root.join("src-tauri/Cargo.toml").exists() {
+            checks.push(TypeCheck {
+                command: "cargo check".into(),
+                working_dir: root.join("src-tauri"),
+            });
         }
 
+        // --- TypeScript ---
+        // Root-level tsconfig.json takes priority; otherwise probe common
+        // frontend subdirectories for a nested TypeScript project.
+        let ts_dir: Option<PathBuf> = if root.join("tsconfig.json").exists() {
+            Some(root.to_path_buf())
+        } else {
+            ["frontend", "client", "web", "ui"]
+                .iter()
+                .find(|sub| root.join(sub).join("tsconfig.json").exists())
+                .map(|sub| root.join(sub))
+        };
+        if let Some(dir) = ts_dir {
+            checks.push(TypeCheck {
+                command: "npx --no-install tsc --noEmit".into(),
+                working_dir: dir,
+            });
+        }
+
+        // --- Go ---
+        if root.join("go.mod").exists() {
+            checks.push(TypeCheck {
+                command: "go vet ./...".into(),
+                working_dir: root.to_path_buf(),
+            });
+        }
+
+        // --- C# / .NET ---
+        // Any .sln or .csproj at the root level triggers a dotnet build.
+        let has_dotnet = std::fs::read_dir(root)
+            .map(|mut it| it.any(|e| e.ok().map_or(false, |entry| {
+                entry.path().extension().map_or(false, |ext| ext == "sln" || ext == "csproj")
+            })))
+            .unwrap_or(false);
+        if has_dotnet {
+            checks.push(TypeCheck {
+                command: "dotnet build".into(),
+                working_dir: root.to_path_buf(),
+            });
+        }
+
+        // --- Python ---
         let has_python = root.join("pyproject.toml").exists()
             || root.join("requirements.txt").exists()
             || root.join("setup.py").exists()
@@ -2167,14 +2286,17 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
                     "python -m compileall -q ."
                 })
             };
-            checks.push(py_cmd);
+            checks.push(TypeCheck {
+                command: py_cmd.to_string(),
+                working_dir: root.to_path_buf(),
+            });
         }
 
         if checks.is_empty() {
             if root.join("package.json").exists() {
                 return "no TypeScript config (tsconfig.json) — nothing to typecheck in this Node project. JS has no compiler-style check; run the tests (npm test) instead.".into();
             }
-            return "no typechecker for this project — typecheck runs `tsc --noEmit` (TypeScript), `cargo check` (Rust), or `compileall` (Python).".into();
+            return "no typechecker for this project — typecheck runs `tsc --noEmit` (TypeScript), `cargo check` (Rust), `go vet ./...` (Go), `dotnet build` (C#/.NET), or `compileall` (Python).".into();
         }
         let mut results = Vec::new();
         for check in &checks {
@@ -2182,32 +2304,33 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
                 #[cfg(windows)]
                 {
                     let mut c = tokio::process::Command::new("powershell");
-                    c.arg("-Command").arg(check);
+                    c.arg("-Command").arg(&check.command);
                     c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW, as elsewhere
                     c
                 }
                 #[cfg(not(windows))]
                 {
                     let mut c = tokio::process::Command::new("sh");
-                    c.arg("-c").arg(check);
+                    c.arg("-c").arg(&check.command);
                     c
                 }
             };
-            cmd.current_dir(root);
+            cmd.current_dir(&check.working_dir);
             cmd.kill_on_drop(true);
-            let outcome = tokio::select! {
-                _ = cancel.cancelled() => {
-                    return format!("Stopped by the user while typechecking: {check}")
+            let outcome = crate::tools::process::run_captured(&mut cmd, cancel, 300).await;
+            let output = match outcome {
+                crate::processes::RunOutcome::Output(o) => o,
+                crate::processes::RunOutcome::Cancelled => {
+                    return format!("Stopped by the user while typechecking: {}", check.command);
                 }
-                res = tokio::time::timeout(std::time::Duration::from_secs(300), cmd.output()) => {
-                    match res {
-                        Ok(Ok(o)) => o,
-                        Ok(Err(e)) => return format!("error launching `{check}`: {e}"),
-                        Err(_) => return format!("`{check}` timed out after 300s"),
-                    }
+                crate::processes::RunOutcome::TimedOut => {
+                    return format!("`{}` timed out after 300s", check.command);
+                }
+                crate::processes::RunOutcome::SpawnFailed(e) => {
+                    return format!("error launching `{}`: {e}", check.command);
                 }
             };
-            results.push(format!("$ {check}\n{}", format_captured(outcome)));
+            results.push(format!("$ {}\n{}", check.command, format_captured(output)));
         }
         results.join("\n\n")
     }
@@ -2217,6 +2340,15 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
     }
 
 
+}
+
+/// A single typecheck command paired with the directory it must run in.
+/// Each check carries its own `working_dir` so nested projects (Tauri's
+/// `src-tauri/`, monorepo frontends) get their checker invoked in the right
+/// subdirectory rather than the session root.
+struct TypeCheck {
+    command: String,
+    working_dir: PathBuf,
 }
 
 // --- Post-edit syntax check --------------------------------------------------
@@ -2266,6 +2398,8 @@ async fn syntax_warning(full: &Path) -> Option<(&'static str, String)> {
         _ => return None,
     };
     let mut cmd = tokio::process::Command::new(program);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
     cmd.args(pre_args).arg(full);
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
@@ -2298,7 +2432,7 @@ async fn append_syntax_warning(mut msg: String, full: &Path, path: &str) -> Stri
     if let Some((lang, w)) = syntax_warning(full).await {
         msg.push_str(&format!(
             "\n\n⚠ Heads up: '{path}' no longer parses as {lang} — {w}. \
-             project_read it and fix the syntax before running it."
+             read_file it and fix the syntax before running it."
         ));
     }
     msg
@@ -2307,6 +2441,8 @@ async fn append_syntax_warning(mut msg: String, full: &Path, path: &str) -> Stri
 /// Run `git rev-parse` and `git status --porcelain` to report live branch and changed files.
 async fn probe_git_status(root: &Path) -> Option<String> {
     let mut branch_cmd = tokio::process::Command::new("git");
+    branch_cmd.stdin(std::process::Stdio::null());
+    branch_cmd.kill_on_drop(true);
     branch_cmd.args(["rev-parse", "--abbrev-ref", "HEAD"]);
     branch_cmd.current_dir(root);
     #[cfg(windows)]
@@ -2326,6 +2462,8 @@ async fn probe_git_status(root: &Path) -> Option<String> {
     }
 
     let mut status_cmd = tokio::process::Command::new("git");
+    status_cmd.stdin(std::process::Stdio::null());
+    status_cmd.kill_on_drop(true);
     status_cmd.args(["status", "--porcelain"]);
     status_cmd.current_dir(root);
     #[cfg(windows)]
@@ -2392,6 +2530,8 @@ async fn probe_git_status(root: &Path) -> Option<String> {
 /// Best-effort: None if the program isn't on PATH or times out. Read-only.
 async fn probe_version(program: &str, arg: &str, timeout: std::time::Duration) -> Option<String> {
     let mut cmd = tokio::process::Command::new(program);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
     cmd.arg(arg);
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
@@ -2707,17 +2847,21 @@ mod project_read_tools_tests {
         let file = root.join("test.txt");
         std::fs::write(&file, "line1\nline2\nline3\nline4\nline5\n").unwrap();
 
-        // Normal start and end
+        // Normal start and lines
+        let out_lines = Tools::run_project_read_lines(&json!({ "path": "test.txt", "start": 2, "lines": 3 }).to_string(), root);
+        assert!(out_lines.contains("2\tline2\n3\tline3\n4\tline4"), "{out_lines}");
+
+        // Normal start and end (backward compatibility)
         let out = Tools::run_project_read_lines(&json!({ "path": "test.txt", "start": 2, "end": 4 }).to_string(), root);
         assert!(out.contains("2\tline2\n3\tline3\n4\tline4"), "{out}");
 
-        // Aliases start_line and end_line as strings
-        let out_alias = Tools::run_project_read_lines(&json!({ "path": "test.txt", "start_line": "2", "end_line": "3" }).to_string(), root);
+        // Aliases offset and limit as strings
+        let out_alias = Tools::run_project_read_lines(&json!({ "path": "test.txt", "offset": "2", "limit": "2" }).to_string(), root);
         assert!(out_alias.contains("2\tline2\n3\tline3"), "{out_alias}");
 
-        // Reversed line range returns clear error
-        let out_rev = Tools::run_project_read_lines(&json!({ "path": "test.txt", "start": 5, "end": 2 }).to_string(), root);
-        assert!(out_rev.contains("error: end line (2) is before start line (5)"), "{out_rev}");
+        // Auto-heal when end < start (treats end as count): start 3, end 2 -> lines 3, 4
+        let out_heal = Tools::run_project_read_lines(&json!({ "path": "test.txt", "start": 3, "end": 2 }).to_string(), root);
+        assert!(out_heal.contains("3\tline3\n4\tline4"), "{out_heal}");
     }
 
     #[test]
@@ -2777,7 +2921,16 @@ mod project_read_tools_tests {
             root,
         );
         assert!(out_over.contains("of 2000;"), "{out_over}");
-        assert!(out_over.contains("file exceeds the 100000 char ceiling. Use read_file_lines to read targeted ranges"), "{out_over}");
+        assert!(out_over.contains("file exceeds the 100000 char ceiling. Pass start and lines to read_file to read targeted ranges"), "{out_over}");
+
+        // Delegating read_file with start/lines to run_project_read_lines
+        let out_ranged = Tools::run_project_read(
+            &json!({ "path": "over.txt", "start": 10, "lines": 5 }).to_string(),
+            root,
+        );
+        assert!(out_ranged.contains("'over.txt' lines 10–14 (of 2000):"), "{out_ranged}");
+        assert!(out_ranged.contains("10\tline 0010:"), "{out_ranged}");
+        assert!(out_ranged.contains("14\tline 0014:"), "{out_ranged}");
     }
 }
 
@@ -3493,6 +3646,150 @@ mod project_tests {
     }
 
     #[tokio::test]
+    async fn test_typecheck_detects_nested_tauri_crate() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "outpost_typecheck_tauri_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("src-tauri")).unwrap();
+        std::fs::write(
+            temp_dir.join("src-tauri/Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        // No root-level Cargo.toml — the src-tauri/ layout must be detected.
+        assert!(!temp_dir.join("Cargo.toml").exists());
+
+        let cancel = CancellationToken::new();
+        let out = Tools::run_typecheck(Some(&temp_dir), &cancel).await;
+
+        assert!(
+            out.contains("cargo check"),
+            "typecheck should detect nested src-tauri/Cargo.toml and run cargo check, got:\n{out}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_typecheck_detects_go_project() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "outpost_typecheck_go_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(
+            temp_dir.join("go.mod"),
+            "module test\n\ngo 1.21\n",
+        )
+        .unwrap();
+
+        let cancel = CancellationToken::new();
+        let out = Tools::run_typecheck(Some(&temp_dir), &cancel).await;
+
+        assert!(
+            out.contains("go vet"),
+            "typecheck should detect go.mod and run go vet, got:\n{out}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_typecheck_detects_dotnet_project() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "outpost_typecheck_dotnet_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(
+            temp_dir.join("Test.sln"),
+            "",
+        )
+        .unwrap();
+
+        let cancel = CancellationToken::new();
+        let out = Tools::run_typecheck(Some(&temp_dir), &cancel).await;
+
+        assert!(
+            out.contains("dotnet build"),
+            "typecheck should detect .sln and run dotnet build, got:\n{out}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_typecheck_detects_subdirectory_frontend() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "outpost_typecheck_subdir_frontend_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("frontend")).unwrap();
+        std::fs::write(
+            temp_dir.join("frontend/tsconfig.json"),
+            "{}",
+        )
+        .unwrap();
+        // No root-level tsconfig.json — the frontend/ subdirectory must be detected.
+        assert!(!temp_dir.join("tsconfig.json").exists());
+
+        let cancel = CancellationToken::new();
+        let out = Tools::run_typecheck(Some(&temp_dir), &cancel).await;
+
+        assert!(
+            out.contains("tsc --noEmit"),
+            "typecheck should detect frontend/tsconfig.json and run tsc, got:\n{out}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_typecheck_polyglot_runs_all_matching() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "outpost_typecheck_polyglot_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("src-tauri")).unwrap();
+        std::fs::write(temp_dir.join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(
+            temp_dir.join("src-tauri/Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+
+        let cancel = CancellationToken::new();
+        let out = Tools::run_typecheck(Some(&temp_dir), &cancel).await;
+
+        assert!(
+            out.contains("cargo check"),
+            "polyglot typecheck should run cargo check, got:\n{out}"
+        );
+        assert!(
+            out.contains("tsc --noEmit"),
+            "polyglot typecheck should run tsc --noEmit, got:\n{out}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
     async fn syntax_warning_detects_rust_syntax_error_in_memory() {
         let temp_dir = std::env::temp_dir().join(format!("outpost_syntax_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -3565,5 +3862,19 @@ mod project_tests {
         assert!(out.contains("[content truncated at 2000 chars"), "files should be capped at fair share:\n{out}");
         assert!(out.contains("… (truncated — pass a larger max_chars"));
         assert!(out.chars().count() <= 10_000 + 300); // respects max_chars boundary + headers
+    }
+
+    #[test]
+    fn project_read_and_read_lines_reject_directory() {
+        let temp_dir = std::env::temp_dir().join(format!("outpost_dir_reject_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(temp_dir.join("subfolder")).unwrap();
+
+        let read_out = Tools::run_project_read(&serde_json::json!({ "path": "subfolder" }).to_string(), &temp_dir);
+        assert!(read_out.contains("is a directory"), "project_read must report directory: {read_out}");
+
+        let lines_out = Tools::run_project_read_lines(&serde_json::json!({ "path": "subfolder" }).to_string(), &temp_dir);
+        assert!(lines_out.contains("is a directory"), "project_read_lines must report directory: {lines_out}");
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

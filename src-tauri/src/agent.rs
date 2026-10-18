@@ -59,6 +59,24 @@ fn is_truncated(finish: Option<&str>) -> bool {
     matches!(finish, Some("length") | Some("max_tokens"))
 }
 
+/// Does the generated string contain only whitespace, BOM, zero-width characters, or nulls?
+///
+/// In Rust, `char::is_whitespace()` follows Unicode `White_Space`, which explicitly excludes
+/// Byte Order Marks (`\u{feff}`), zero-width characters (`\u{200b}`, `\u{200c}`, `\u{200d}`, `\u{2060}`),
+/// and nulls (`\0`). Reverse proxies and certain API gateways emit these as padding or framing artifacts.
+/// Meanwhile, ECMAScript `String.prototype.trim()` in the frontend treats `\u{feff}` as whitespace.
+/// Checking against these prevents Rust from treating a ghost zero-width payload as valid model speech.
+fn is_blank_or_invisible(s: &str) -> bool {
+    s.trim_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '\0' | '\u{feff}' | '\u{200b}' | '\u{200c}' | '\u{200d}' | '\u{2060}'
+            )
+    })
+    .is_empty()
+}
+
 pub async fn run_turn(
     provider: Arc<dyn Provider>,
     tools: Arc<Tools>,
@@ -76,10 +94,20 @@ pub async fn run_turn(
         .filter(|t| enabled_tools.iter().any(|e| e == &t.name))
         .collect();
 
+    // Drain any leftover pending images from an aborted earlier turn so they
+    // aren't mistakenly attached to this turn's first tool result.
+    let _ = tools.take_pending_images();
+
     let mut seen_paths: Vec<String> = Vec::new();
     let mut empty_retries = 0usize;
     let mut last_tool_call: Option<(String, String, usize)> = None;
     let max_iterations = resolve_max_iterations(request.max_tool_calls);
+    let mut seen_tool_ids: std::collections::HashSet<String> = request
+        .messages
+        .iter()
+        .flat_map(|m| m.tool_calls.iter().map(|tc| tc.id.clone()))
+        .filter(|id| !id.is_empty())
+        .collect();
 
     for iteration_index in 0..max_iterations {
         if cancel.is_cancelled() {
@@ -150,6 +178,14 @@ pub async fn run_turn(
                                 return Ok(());
                             }
                         }
+                        StreamEvent::PromoteToReasoning => {
+                            if !assistant_text.is_empty() {
+                                assistant_reasoning.push_str(&std::mem::take(&mut assistant_text));
+                            }
+                            if on_event.send(StreamEvent::PromoteToReasoning).is_err() {
+                                return Ok(());
+                            }
+                        }
                         // Backend-internal: keep the thinking block's signature so it
                         // can be replayed beside a tool_use next iteration (Anthropic).
                         // Not forwarded to the UI.
@@ -159,13 +195,22 @@ pub async fn run_turn(
                         StreamEvent::ToolStart { name } => {
                             let _ = on_event.send(StreamEvent::ToolStart { name });
                         }
-                        StreamEvent::ToolCall(call) => {
+                        StreamEvent::ToolCall(mut call) => {
+                            if call.id.trim().is_empty() || !seen_tool_ids.insert(call.id.clone()) {
+                                let mut candidate = format!("call_{}_{}", iteration_index, calls.len());
+                                let mut bump = 0usize;
+                                while !seen_tool_ids.insert(candidate.clone()) {
+                                    bump += 1;
+                                    candidate = format!("call_{}_{}_{}", iteration_index, calls.len(), bump);
+                                }
+                                call.id = candidate;
+                            }
                             eprintln!(
-                                "[agent] tool_call: {} ({} arg bytes)",
+                                "[agent] tool_call: {} [{}] ({} arg bytes)",
                                 call.name,
+                                call.id,
                                 call.arguments.len()
                             );
-                            let _ = on_event.send(StreamEvent::ToolCall(call.clone()));
                             calls.push(call);
                         }
                         // Approval/result/run-code events originate here, not from the
@@ -203,7 +248,7 @@ pub async fn run_turn(
         // re-request; don't record the empty turn, so the retry re-sends the same
         // request rather than continuing past a blank assistant turn. If it's still
         // empty, say what happened instead of vanishing.
-        if calls.is_empty() && assistant_text.trim().is_empty() {
+        if calls.is_empty() && is_blank_or_invisible(&assistant_text) {
             if empty_retries < MAX_EMPTY_RETRIES {
                 empty_retries += 1;
                 continue;
@@ -300,6 +345,7 @@ pub async fn run_turn(
                 });
                 return Ok(());
             }
+            let _ = on_event.send(StreamEvent::ToolCall(call.clone()));
             eprintln!("[agent] executing tool: {}", call.name);
 
             // Check for consecutive identical tool calls to prevent autoregressive looping
@@ -362,12 +408,15 @@ pub async fn run_turn(
                 call.name,
                 result.len()
             );
-            // Track files this turn has read or written, for html_write's collision
+            // Track files this turn has read or written, for md_write / html_write's collision
             // check (an intended overwrite vs. an accidental same-name new page).
-            if matches!(call.name.as_str(), "read_note" | "html_write" | "html_edit") {
+            if matches!(
+                call.name.as_str(),
+                "read_note" | "md_write" | "md_edit" | "html_write" | "html_edit"
+            ) {
                 if let Some(p) = serde_json::from_str::<serde_json::Value>(&call.arguments)
                     .ok()
-                    .and_then(|v| v.get("path").and_then(|p| p.as_str()).map(str::to_string))
+                    .and_then(|v| crate::tools::arg_str(&v, crate::tools::PATH_ALIASES).map(str::to_string))
                 {
                     if !seen_paths.contains(&p) {
                         seen_paths.push(p);
@@ -448,16 +497,19 @@ pub async fn run_turn(
         // was user/assistant alternation on the Anthropic backend; system
         // messages have since made that constraint moot, but the adjacency still
         // reads better.)
-        if let Some(last) = request.messages.last_mut() {
-            if matches!(last.role, Role::Tool) {
-                last.content.push_str(
-                    "\n\n[System: the tool-call budget for this turn is exhausted. \
-                     This is a hard per-turn cap, not a comment on the task or the \
-                     work's quality. No further tool calls will be executed this \
-                     turn. Summarize for the user what you got done, what's verified, \
-                     and what's left to pick up next.]",
-                );
-            }
+        if let Some(target) = request
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| matches!(m.role, Role::Tool | Role::User))
+        {
+            target.content.push_str(
+                "\n\n[System: the tool-call budget for this turn is exhausted. \
+                 This is a hard per-turn cap, not a comment on the task or the \
+                 work's quality. No further tool calls will be executed this \
+                 turn. Summarize for the user what you got done, what's verified, \
+                 and what's left to pick up next.]",
+            );
         }
         // Keep the tool SCHEMAS. Clearing them reads as obviously right — offer
         // nothing, so it can't call anything — but this history necessarily ends
@@ -487,27 +539,53 @@ pub async fn run_turn(
         // back to a turn that stops with no explanation — so say it ourselves
         // rather than let the failure be silent a second time.
         let mut summarized = false;
-        match provider.stream_chat(request).await {
+        let stream_res = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                let _ = on_event.send(StreamEvent::Done {
+                    finish_reason: Some("cancelled".into()),
+                });
+                return Ok(());
+            }
+            res = provider.stream_chat(request) => res,
+        };
+        match stream_res {
             Ok(mut stream) => {
-                while let Some(event) = stream.next().await {
-                    match event {
-                        StreamEvent::Delta { text } => {
-                            summarized = true;
-                            if on_event.send(StreamEvent::Delta { text }).is_err() {
-                                break;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            let _ = on_event.send(StreamEvent::Done {
+                                finish_reason: Some("cancelled".into()),
+                            });
+                            return Ok(());
+                        }
+                        maybe_event = stream.next() => {
+                            let Some(event) = maybe_event else { break };
+                            match event {
+                                StreamEvent::Delta { text } => {
+                                    summarized = true;
+                                    if on_event.send(StreamEvent::Delta { text }).is_err() {
+                                        break;
+                                    }
+                                }
+                                StreamEvent::Reasoning { text } => {
+                                    let _ = on_event.send(StreamEvent::Reasoning { text });
+                                }
+                                StreamEvent::PromoteToReasoning => {
+                                    summarized = false;
+                                    let _ = on_event.send(StreamEvent::PromoteToReasoning);
+                                }
+                                // Forward it. Discarding the error here is what turned a
+                                // failed wrap-up into "it just stopped".
+                                StreamEvent::Error { message } => {
+                                    let _ = on_event.send(StreamEvent::Error { message });
+                                    break;
+                                }
+                                StreamEvent::Done { .. } => break,
+                                _ => {}
                             }
                         }
-                        StreamEvent::Reasoning { text } => {
-                            let _ = on_event.send(StreamEvent::Reasoning { text });
-                        }
-                        // Forward it. Discarding the error here is what turned a
-                        // failed wrap-up into "it just stopped".
-                        StreamEvent::Error { message } => {
-                            let _ = on_event.send(StreamEvent::Error { message });
-                            break;
-                        }
-                        StreamEvent::Done { .. } => break,
-                        _ => {}
                     }
                 }
             }
@@ -587,7 +665,7 @@ fn estimate_message(m: &Message) -> usize {
     for tc in &m.tool_calls {
         chars += tc.arguments.chars().count();
     }
-    chars / 4 + 4
+    chars / 4 + 4 + m.images.len() * 1000
 }
 
 
@@ -613,11 +691,15 @@ fn cap_context(messages: &[Message], budget: usize) -> Vec<Message> {
         .unwrap_or(messages.len());
     let sys_tokens: usize = messages[..sys_end].iter().map(estimate_message).sum();
     let body = &messages[sys_end..];
-    // Turn boundaries: each user message starts a turn.
+    // Turn boundaries: each genuine user message starts a turn. Skip synthetic
+    // mid-turn screenshot delivery messages (`Role::User` immediately following
+    // `Role::Tool`) so a turn is never sliced in half mid-loop.
     let starts: Vec<usize> = body
         .iter()
         .enumerate()
-        .filter(|(_, m)| matches!(m.role, Role::User))
+        .filter(|&(i, m)| {
+            matches!(m.role, Role::User) && (i == 0 || !matches!(body[i - 1].role, Role::Tool))
+        })
         .map(|(i, _)| i)
         .collect();
     let Some(&last_start) = starts.last() else {
@@ -672,6 +754,7 @@ mod tests {
                 id: "call_1".to_string(),
                 name: "run_command".to_string(),
                 arguments: tool_args.to_string(),
+                extra_content: None,
             }],
             tool_call_id: None,
             created_at: None,
@@ -709,6 +792,11 @@ mod tests {
         // Arguments in tool calls are counted toward the estimate
         let m_tc = make_tool_call_msg("1234", "12345678");
         assert_eq!(estimate_message(&m_tc), (4 + 8) / 4 + 4); // 7
+
+        // Images add 1000 tokens each
+        let mut m_img = make_msg(Role::User, "test");
+        m_img.images = vec!["data:image/png;base64,...".into(), "data:image/png;base64,...".into()];
+        assert_eq!(estimate_message(&m_img), 4 / 4 + 4 + 2000);
     }
 
     #[test]
@@ -864,6 +952,126 @@ mod tests {
         ];
         let capped = cap_context(&msgs, 2);
         assert_eq!(capped.len(), 2);
+    }
+
+    #[test]
+    fn test_cap_context_does_not_split_at_synthetic_screenshot() {
+        let msgs = vec![
+            make_msg(Role::System, "System Prompt"),
+            make_msg(Role::User, "Old user turn 1"),
+            make_msg(Role::Assistant, "Old assistant reply 1"),
+            make_msg(Role::User, "Take a screenshot of the page"),
+            make_msg(Role::Assistant, "Running tool"),
+            make_msg(Role::Tool, "screenshot captured"),
+            make_msg(Role::User, "Screenshot from the tool call above — the current visual state."),
+            make_msg(Role::Assistant, "I see the page now"),
+        ];
+
+        let sys_tokens = estimate_message(&msgs[0]);
+        let turn2_tokens: usize = msgs[3..].iter().map(estimate_message).sum();
+
+        let capped = cap_context(&msgs, sys_tokens + turn2_tokens);
+        assert_eq!(capped.len(), 6);
+        assert_eq!(capped[0].content, "System Prompt");
+        assert_eq!(capped[1].content, "Take a screenshot of the page");
+        assert_eq!(capped[2].content, "Running tool");
+        assert_eq!(capped[3].content, "screenshot captured");
+        assert_eq!(capped[4].content, "Screenshot from the tool call above — the current visual state.");
+        assert_eq!(capped[5].content, "I see the page now");
+    }
+
+    #[test]
+    fn test_tool_call_id_deduplication() {
+        use std::collections::HashSet;
+
+        let mut seen_tool_ids: HashSet<String> = ["call_0".to_string()].into_iter().collect();
+
+        fn dedupe(seen: &mut HashSet<String>, raw_id: &str, iter_idx: usize, call_idx: usize) -> String {
+            let mut id = raw_id.to_string();
+            if id.trim().is_empty() || !seen.insert(id.clone()) {
+                let mut candidate = format!("call_{}_{}", iter_idx, call_idx);
+                let mut bump = 0usize;
+                while !seen.insert(candidate.clone()) {
+                    bump += 1;
+                    candidate = format!("call_{}_{}_{}", iter_idx, call_idx, bump);
+                }
+                id = candidate;
+            }
+            id
+        }
+
+        // First call with "call_0" is already seen, so it gets remapped
+        let id1 = dedupe(&mut seen_tool_ids, "call_0", 1, 0);
+        assert_eq!(id1, "call_1_0");
+
+        // Another call with "call_0" in same iteration gets remapped to distinct ID
+        let id2 = dedupe(&mut seen_tool_ids, "call_0", 1, 1);
+        assert_eq!(id2, "call_1_1");
+
+        // Empty ID gets assigned a unique ID
+        let id3 = dedupe(&mut seen_tool_ids, "", 2, 0);
+        assert_eq!(id3, "call_2_0");
+
+        // Collision with existing candidate triggers bump counter
+        seen_tool_ids.insert("call_3_0".to_string());
+        let id4 = dedupe(&mut seen_tool_ids, "call_3_0", 3, 0);
+        assert_eq!(id4, "call_3_0_1");
+
+        // Unique ID is preserved as-is
+        let id5 = dedupe(&mut seen_tool_ids, "chatcmpl-unique-123", 4, 0);
+        assert_eq!(id5, "chatcmpl-unique-123");
+    }
+
+    #[test]
+    fn test_wrapup_injection_targets_tool_or_user() {
+        let mut messages = vec![
+            make_msg(Role::System, "You are Outpost."),
+            make_msg(Role::User, "Take a screenshot"),
+            make_msg(Role::Assistant, "Running tool..."),
+            make_tool_result_msg("t1", "captured"),
+            make_msg(Role::User, "Screenshot from the tool call above"),
+        ];
+
+        if let Some(target) = messages
+            .iter_mut()
+            .rev()
+            .find(|m| matches!(m.role, Role::Tool | Role::User))
+        {
+            target.content.push_str("\n\n[System: the tool-call budget for this turn is exhausted.]");
+        }
+
+        // The note should be appended to the synthetic user screenshot message at the end
+        assert!(messages.last().unwrap().content.contains("[System: the tool-call budget for this turn is exhausted.]"));
+
+        // When only a tool message is present at the end
+        let mut messages_tool_only = vec![
+            make_msg(Role::System, "You are Outpost."),
+            make_msg(Role::User, "List files"),
+            make_msg(Role::Assistant, "Listing..."),
+            make_tool_result_msg("t1", "file1.rs"),
+        ];
+        if let Some(target) = messages_tool_only
+            .iter_mut()
+            .rev()
+            .find(|m| matches!(m.role, Role::Tool | Role::User))
+        {
+            target.content.push_str("\n\n[System: the tool-call budget for this turn is exhausted.]");
+        }
+        assert!(messages_tool_only.last().unwrap().content.contains("[System: the tool-call budget for this turn is exhausted.]"));
+    }
+
+    #[test]
+    fn test_is_blank_or_invisible() {
+        assert!(is_blank_or_invisible(""));
+        assert!(is_blank_or_invisible("   \t\r\n  "));
+        assert!(is_blank_or_invisible("\u{feff}"));
+        assert!(is_blank_or_invisible("\u{200b}"));
+        assert!(is_blank_or_invisible("\u{200c}\u{200d}\u{2060}"));
+        assert!(is_blank_or_invisible("\0"));
+        assert!(is_blank_or_invisible(" \u{feff}\n \u{200b} \t "));
+        assert!(!is_blank_or_invisible("a"));
+        assert!(!is_blank_or_invisible("\u{feff}hello"));
+        assert!(!is_blank_or_invisible("world\u{200b}"));
     }
 }
 

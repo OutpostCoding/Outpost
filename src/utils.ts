@@ -35,18 +35,19 @@ export interface PendingEdit {
 export type Connection = {
   id: string;
   label: string;
-  kind: "openai" | "anthropic";
+  kind: "openai" | "anthropic" | "gemini";
   baseUrl: string;
   needsKey: boolean;
   ready: boolean; // false = adapter not wired yet, so selecting it is blocked
   // Which reasoning-control dialect this provider speaks, if any. Set = the Think
   // dropdown shows and the backend maps its level to the right wire params.
   // "anthropic" → thinking/adaptive + output_config.effort (native adapter);
+  // "gemini" → thinkingConfig: { thinkingBudget, includeThoughts } (native adapter);
   // "deepseek" → thinking:{type} + reasoning_effort (OpenAI adapter; GLM shares it);
-  // "openai" → bare reasoning_effort (OpenAI o-series/gpt-5, and Gemini + Mistral via
+  // "openai" → bare reasoning_effort (OpenAI o-series/gpt-5, and Mistral via
   //   their OpenAI-compatible endpoints); "openrouter" → reasoning:{effort} (its
   //   unified param, normalized across the whole catalogue); "inception" → reasoning_summary:true + reasoning_effort.
-  reasoning?: "anthropic" | "deepseek" | "openai" | "openrouter" | "inception";
+  reasoning?: "anthropic" | "deepseek" | "openai" | "openrouter" | "inception" | "gemini";
   // OBSOLETE (2026-08-30): the per-turn tail folds into the one leading system
   // block on every adapter, so this capability is no longer consulted anywhere.
   // Kept only so saved connections don't break the contract — retire it with
@@ -107,9 +108,6 @@ export type Prefs = {
   codeGroups?: Record<string, boolean>;
   // Read stub pruning turns (default 2 turns, Claude Code style; 1 = aggressive, 0/null = unlimited).
   read_prune_turns?: number | null;
-  // Enforce sequential tool calls (single tool call per assistant generation).
-  // Defaults to false (opt-in) to protect small/local models and prevent LM Studio streaming diff crashes.
-  sequentialToolCalls?: boolean;
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -149,7 +147,7 @@ export const CONNECTIONS: Connection[] = [
   // 3. Western frontier labs
   { id: "anthropic", label: "Anthropic — Claude", kind: "anthropic", baseUrl: "https://api.anthropic.com", needsKey: true, ready: true, reasoning: "anthropic", midSystemMessages: true },
   { id: "openai", label: "OpenAI", kind: "openai", baseUrl: "https://api.openai.com/v1", needsKey: true, ready: true, reasoning: "openai" },
-  { id: "gemini", label: "Google Gemini", kind: "openai", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", needsKey: true, ready: true, reasoning: "openai" },
+  { id: "gemini", label: "Google Gemini", kind: "gemini", baseUrl: "https://generativelanguage.googleapis.com", needsKey: true, ready: true, reasoning: "gemini" },
   { id: "xai", label: "xAI (Grok)", kind: "openai", baseUrl: "https://api.x.ai/v1", needsKey: true, ready: true },
 
   // 4. European flagship
@@ -159,6 +157,7 @@ export const CONNECTIONS: Connection[] = [
   { id: "deepseek", label: "DeepSeek", kind: "openai", baseUrl: "https://api.deepseek.com/v1", needsKey: true, ready: true, reasoning: "deepseek" },
   { id: "qwen", label: "Qwen (DashScope)", kind: "openai", baseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", needsKey: true, ready: true },
   { id: "zai", label: "Z.ai (GLM)", kind: "openai", baseUrl: "https://api.z.ai/api/paas/v4", needsKey: true, ready: true, reasoning: "deepseek" },
+  { id: "xhtoken", label: "XHToken (Horizon)", kind: "openai", baseUrl: "https://api.xhtoken.ai/v1", needsKey: true, ready: true, reasoning: "deepseek" },
   { id: "mimo", label: "Xiaomi MiMo", kind: "anthropic", baseUrl: "https://api.xiaomimimo.com/anthropic", needsKey: true, ready: true },
 
   // 6. Specialized & high-speed inference
@@ -215,7 +214,6 @@ export const CODE_CORE = [
   "find_symbols",
   "typecheck",
   "read_file",
-  "read_file_lines",
   "write_file",
   "edit_file",
   "delete_file",
@@ -324,9 +322,15 @@ export function deriveTitle(messages: Message[]): string {
           s.args
         ) {
           try {
-            const path = (JSON.parse(s.args) as { path?: unknown }).path;
-            if (typeof path === "string" && path) {
-              const file = path.split("/").pop() ?? path;
+            const parsed = JSON.parse(s.args) as { path?: unknown; file?: unknown };
+            const rawPath =
+              typeof parsed.path === "string"
+                ? parsed.path
+                : typeof parsed.file === "string"
+                  ? parsed.file
+                  : null;
+            if (rawPath) {
+              const file = rawPath.split(/[/\\]/).pop() ?? rawPath;
               return file.length > 42 ? `${file.slice(0, 42)}…` : file;
             }
           } catch {}
@@ -699,7 +703,44 @@ export function toolTitle(name: string, args: string): string {
       return at("search", s("query"));
     case "read_file":
     case "project_read":
-      return at("read", s("path"));
+    case "read_file_lines":
+    case "project_read_lines": {
+      const p = s("path");
+      const num = (...keys: string[]): number | undefined => {
+        for (const k of keys) {
+          const v = a[k];
+          if (typeof v === "number" && !Number.isNaN(v)) return v;
+          if (typeof v === "string") {
+            const parsed = parseInt(v, 10);
+            if (!Number.isNaN(parsed)) return parsed;
+          }
+        }
+        return undefined;
+      };
+      const rawStart = num("start", "start_line", "from", "line_start", "offset");
+      const lines = num("lines", "limit", "count", "num_lines", "max_lines", "length");
+      const rawEnd = num("end", "end_line", "to", "line_end");
+      const isLinesVariant = name === "read_file_lines" || name === "project_read_lines";
+      const hasRange = isLinesVariant || rawStart !== undefined || lines !== undefined || rawEnd !== undefined;
+
+      if (!hasRange) {
+        return at("read", p);
+      }
+
+      const sl = Math.max(1, rawStart ?? 1);
+      let el: number | string = "end";
+      if (lines !== undefined) {
+        el = sl + Math.max(1, lines) - 1;
+      } else if (rawEnd !== undefined) {
+        if (rawEnd < sl) {
+          // Auto-heal: model passed a relative line count as 'end'
+          el = sl + Math.max(1, rawEnd) - 1;
+        } else {
+          el = rawEnd;
+        }
+      }
+      return p ? `read ${p} (L${sl}–${el})` : isLinesVariant ? "read lines" : "read";
+    }
     case "list_dir":
     case "project_list":
       return at("list", s("path") || ".");
@@ -757,13 +798,6 @@ export function toolTitle(name: string, args: string): string {
     }
     case "run_python":
       return "run_python";
-    case "read_file_lines":
-    case "project_read_lines": {
-      const p = s("path");
-      const sl = typeof a["start"] === "number" ? a["start"] : "?";
-      const el = typeof a["end"] === "number" ? a["end"] : "end";
-      return p ? `read ${p} (L${sl}–${el})` : "read lines";
-    }
     case "read_image":
     case "project_read_image": {
       const p = s("path");

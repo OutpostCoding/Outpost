@@ -47,7 +47,6 @@ impl LmStudioProvider {
         url: String,
         api_key: Option<String>,
         body: serde_json::Map<String, Value>,
-        sequential: bool,
         reasoning_already_emitted: usize,
         delta_already_emitted: usize,
     ) -> EventStream {
@@ -123,18 +122,14 @@ impl LmStudioProvider {
                                         let arguments = if arguments.trim().is_empty() {
                                             "{}".to_string()
                                         } else {
-                                            arguments
+                                            extract_valid_json_args(&arguments).unwrap_or(arguments)
                                         };
-                                        fallback_tools.push(ToolCall { id, name, arguments });
+                                        let extra_content = extract_extra_content(tcd)
+                                            .or_else(|| tcd.get("function").and_then(extract_extra_content))
+                                            .or_else(|| extract_extra_content(msg))
+                                            .or_else(|| extract_extra_content(choice));
+                                        fallback_tools.push(ToolCall { id, name, arguments, extra_content });
                                     }
-                                }
-
-                                if sequential && fallback_tools.len() > 1 {
-                                    eprintln!(
-                                        "[lmstudio] non-streaming: truncating {} tool calls to 1 (sequential active)",
-                                        fallback_tools.len()
-                                    );
-                                    fallback_tools.truncate(1);
                                 }
 
                                 let has_tools = !fallback_tools.is_empty();
@@ -173,7 +168,7 @@ impl LmStudioProvider {
                                 return;
                             }
                             EngineErrorKind::DiffParser(_) => {
-                                let (extracted_text, mut salvaged) = salvage_tools_from_diff_error(&err_body);
+                                let (extracted_text, salvaged) = salvage_tools_from_diff_error(&err_body);
                                 if let Some(txt) = extracted_text {
                                     let s = safe_unemitted_suffix(&txt, delta_already_emitted);
                                     if !s.is_empty() {
@@ -181,13 +176,6 @@ impl LmStudioProvider {
                                     }
                                 }
                                 if !salvaged.is_empty() {
-                                    if sequential && salvaged.len() > 1 {
-                                        eprintln!(
-                                            "[lmstudio] non-streaming: truncating {} salvaged tool calls to 1 (sequential active)",
-                                            salvaged.len()
-                                        );
-                                        salvaged.truncate(1);
-                                    }
                                     eprintln!(
                                         "[lmstudio] salvaged {} valid tool calls from non-streaming diff error: {:?}",
                                         salvaged.len(),
@@ -229,6 +217,51 @@ struct ToolCallAcc {
     arguments: String,
     /// Whether a ToolStart has been emitted for this call yet.
     started: bool,
+    /// Provider-specific extensions (e.g. Google Gemini's `thought_signature`).
+    extra_content: Option<Value>,
+}
+
+/// Extract and normalize provider-specific extension payloads (such as Google Gemini's
+/// `thought_signature` or `extra_content`) from delta chunks, tool call fragments, or messages.
+pub(crate) fn extract_extra_content(val: &Value) -> Option<Value> {
+    if let Some(extra) = val.get("extra_content") {
+        if extra.is_object() {
+            let mut obj = extra.clone();
+            // If it has thought_signature directly but not under google, ensure google.thought_signature exists
+            if let Some(sig) = obj.get("thought_signature").and_then(Value::as_str).map(String::from) {
+                if obj.get("google").is_none() {
+                    obj.as_object_mut().unwrap().insert("google".into(), json!({ "thought_signature": sig }));
+                }
+            }
+            return Some(obj);
+        }
+    }
+    if let Some(sig) = val.get("thought_signature").or_else(|| val.get("thoughtSignature")).and_then(Value::as_str) {
+        return Some(json!({
+            "google": {
+                "thought_signature": sig
+            }
+        }));
+    }
+    if let Some(google) = val.get("google") {
+        if let Some(sig) = google.get("thought_signature").or_else(|| google.get("thoughtSignature")).and_then(Value::as_str) {
+            return Some(json!({
+                "google": {
+                    "thought_signature": sig
+                }
+            }));
+        }
+    }
+    if let Some(psf) = val.get("provider_specific_fields") {
+        if let Some(sig) = psf.get("thought_signature").and_then(Value::as_str) {
+            return Some(json!({
+                "google": {
+                    "thought_signature": sig
+                }
+            }));
+        }
+    }
+    None
 }
 
 /// A short label for error messages — the host[:port] from the base URL, so a
@@ -288,11 +321,14 @@ fn to_openai_messages_with_opts(messages: &[Message], include_reasoning: bool) -
                     .tool_calls
                     .iter()
                     .map(|tc| {
-                        json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": { "name": tc.name, "arguments": tc.arguments }
-                        })
+                        let mut call_obj = serde_json::Map::new();
+                        call_obj.insert("id".into(), json!(tc.id));
+                        call_obj.insert("type".into(), json!("function"));
+                        call_obj.insert("function".into(), json!({ "name": tc.name, "arguments": tc.arguments }));
+                        if let Some(extra) = &tc.extra_content {
+                            call_obj.insert("extra_content".into(), extra.clone());
+                        }
+                        Value::Object(call_obj)
                     })
                     .collect();
                 obj.insert("tool_calls".into(), json!(calls));
@@ -457,6 +493,7 @@ fn salvage_tools_from_diff_error(raw_err: &str) -> (Option<String>, Vec<ToolCall
                                     id: format!("call_{}", salvaged_tools.len()),
                                     name: name.to_string(),
                                     arguments: valid_args,
+                                    extra_content: None,
                                 });
                             }
                         }
@@ -507,13 +544,20 @@ fn salvage_tools_from_diff_error(raw_err: &str) -> (Option<String>, Vec<ToolCall
 /// block may only OPEN before then — at the leading edge of the answer. A `<think>`
 /// that appears *after* answer text is the model typing the characters literally
 /// (e.g. quoting a discussion of reasoning tags), so it's passed through as text, not
-/// misread as a real reasoning block mid-sentence. Genuine inline-thinking models put
-/// their `<think>…</think>` first, so they're unaffected.
+/// misread as a real reasoning block mid-sentence.
+///
+/// `saw_think_tag` tracks whether `<think>` or `</think>` (or a dedicated reasoning
+/// field) has already been seen. When `false`, an unquoted closing `</think>` means
+/// the model's prompt template prefilled `<think>` before generation started — so
+/// everything emitted up to `</think>` is promoted from `Delta` to `Reasoning` via
+/// `StreamEvent::PromoteToReasoning` with zero buffering latency on normal models.
 fn push_split(
     out: &mut Vec<StreamEvent>,
     carry: &mut String,
     in_think: &mut bool,
     text_started: &mut bool,
+    saw_think_tag: &mut bool,
+    last_emitted_char: &mut Option<char>,
 ) {
     loop {
         if *in_think {
@@ -525,6 +569,7 @@ fn push_split(
                 }
                 *carry = carry[pos + "</think>".len()..].to_string();
                 *in_think = false;
+                *saw_think_tag = true;
             } else {
                 let hold = longest_prefix_suffix(carry, "</think>");
                 let emit_len = carry.len() - hold;
@@ -537,44 +582,101 @@ fn push_split(
                 break;
             }
         } else if *text_started {
-            // Past the leading edge — everything is answer text; any `<think>` is literal.
-            if !carry.is_empty() {
-                out.push(StreamEvent::Delta { text: std::mem::take(carry) });
+            if *saw_think_tag {
+                // Past the leading edge and a think boundary was already resolved —
+                // everything remaining is answer text; any `<think>` is literal.
+                if !carry.is_empty() {
+                    *last_emitted_char = carry.chars().next_back();
+                    out.push(StreamEvent::Delta { text: std::mem::take(carry) });
+                }
+                break;
             }
-            break;
+            let open_pos = carry.find("<think>");
+            let close_pos = carry.find("</think>");
+            if open_pos.map_or(false, |op| close_pos.map_or(true, |cp| op < cp)) {
+                // A literal `<think>` appeared after answer text started — keep it
+                // and any matching `</think>` as literal answer text.
+                *saw_think_tag = true;
+                *last_emitted_char = carry.chars().next_back();
+                out.push(StreamEvent::Delta { text: std::mem::take(carry) });
+                break;
+            } else if let Some(pos) = close_pos {
+                let prev_char = if pos > 0 {
+                    carry[..pos].chars().next_back()
+                } else {
+                    *last_emitted_char
+                };
+                let after_tag = &carry[pos + "</think>".len()..];
+                let next_char = after_tag.chars().next();
+                let is_quoted = matches!(prev_char, Some('`' | '"' | '\''))
+                    || matches!(next_char, Some('`' | '"' | '\''));
+                if is_quoted {
+                    // Inline quoted tag in prose (e.g. `</think>`) — keep as literal text.
+                    *saw_think_tag = true;
+                    *last_emitted_char = carry.chars().next_back();
+                    out.push(StreamEvent::Delta { text: std::mem::take(carry) });
+                    break;
+                }
+                // Genuine unmatched `</think>` closing a prefilled `<think>` block:
+                // promote prior Delta text to Reasoning and emit the tail before `pos`.
+                out.push(StreamEvent::PromoteToReasoning);
+                let before = carry[..pos].to_string();
+                if !before.is_empty() {
+                    out.push(StreamEvent::Reasoning { text: before });
+                }
+                *carry = carry[pos + "</think>".len()..].to_string();
+                *saw_think_tag = true;
+                *last_emitted_char = None;
+            } else {
+                // Hold back only a trailing partial `<think>` or `</think>` prefix (<= 7 bytes)
+                // so normal models stream with zero buffering delay.
+                let hold = longest_prefix_suffix(carry, "</think>")
+                    .max(longest_prefix_suffix(carry, "<think>"));
+                let emit_len = carry.len() - hold;
+                if emit_len > 0 {
+                    let text = carry[..emit_len].to_string();
+                    *last_emitted_char = text.chars().next_back();
+                    out.push(StreamEvent::Delta { text });
+                    *carry = carry[emit_len..].to_string();
+                }
+                break;
+            }
         } else {
             // Leading edge: a `<think>` with only whitespace before it opens a real
-            // reasoning block; anything else means the answer has started.
+            // reasoning block; anything else means the answer (or prefilled thought) has started.
             match carry.find("<think>") {
                 Some(pos) if carry[..pos].trim().is_empty() => {
                     *carry = carry[pos + "<think>".len()..].to_string();
                     *in_think = true;
+                    *saw_think_tag = true;
                 }
                 Some(_) => {
                     // Real text precedes the tag → the answer started; emit it all as
                     // text (the `<think>` is literal).
                     *text_started = true;
+                    *saw_think_tag = true;
+                    *last_emitted_char = carry.chars().next_back();
                     out.push(StreamEvent::Delta { text: std::mem::take(carry) });
                     break;
                 }
                 None => {
                     // No `<think>` yet. If everything but a possible partial `<think>`
                     // tail is whitespace, we're still in the run-up — hold the tail.
-                    // Otherwise the answer text has started.
+                    // Otherwise transition to `text_started` and loop so the `*text_started`
+                    // arm can check for a prefilled `</think>` or partial tag suffix.
                     let hold = longest_prefix_suffix(carry, "<think>");
                     let head_len = carry.len() - hold;
                     if carry[..head_len].trim().is_empty() {
                         if head_len > 0 {
-                            out.push(StreamEvent::Delta {
-                                text: carry[..head_len].to_string(),
-                            });
+                            let text = carry[..head_len].to_string();
+                            *last_emitted_char = text.chars().next_back();
+                            out.push(StreamEvent::Delta { text });
                         }
                         *carry = carry[head_len..].to_string();
+                        break;
                     } else {
                         *text_started = true;
-                        out.push(StreamEvent::Delta { text: std::mem::take(carry) });
                     }
-                    break;
                 }
             }
         }
@@ -612,7 +714,6 @@ impl Provider for LmStudioProvider {
         body.insert("stream".into(), json!(true));
         if !request.tools.is_empty() {
             body.insert("tools".into(), json!(to_openai_tools(&request.tools)));
-            body.insert("parallel_tool_calls".into(), json!(false));
         }
         if let Some(t) = request.temperature {
             body.insert("temperature".into(), json!(t));
@@ -631,8 +732,6 @@ impl Provider for LmStudioProvider {
             request.reasoning_style.as_deref(),
             request.thinking_effort.as_deref(),
         ));
-
-        let sequential = request.sequential_tool_calls.unwrap_or(false);
 
         let mut req = self.http.post(&url).json(&Value::Object(body.clone()));
         if let Some(key) = &self.api_key {
@@ -655,15 +754,8 @@ impl Provider for LmStudioProvider {
                         "[lmstudio] caught LM Studio streaming parser error on initial request ({status}: {trimmed})."
                     );
 
-                    let (extracted_text, mut salvaged) = salvage_tools_from_diff_error(trimmed);
+                    let (extracted_text, salvaged) = salvage_tools_from_diff_error(trimmed);
                     if !salvaged.is_empty() {
-                        if sequential && salvaged.len() > 1 {
-                            eprintln!(
-                                "[lmstudio] truncating {} salvaged tool calls to 1 (sequential active)",
-                                salvaged.len()
-                            );
-                            salvaged.truncate(1);
-                        }
                         eprintln!(
                             "[lmstudio] salvaged {} valid tool calls directly from initial diff error: {:?}",
                             salvaged.len(),
@@ -688,7 +780,6 @@ impl Provider for LmStudioProvider {
                         url,
                         self.api_key.clone(),
                         body,
-                        sequential,
                         0,
                         0,
                     ));
@@ -739,12 +830,18 @@ impl Provider for LmStudioProvider {
             let mut buf: Vec<u8> = Vec::new();
             let mut tools_acc: Vec<ToolCallAcc> = Vec::new();
             let mut finish_reason: Option<String> = None;
+            let mut pending_extra_content: Option<Value> = None;
             // Reasoning state: `carry` holds pending content (and any partial think
             // tag); `in_think` tracks whether we're inside a <think> block;
-            // `text_started` gates opening one to the leading edge of the answer.
+            // `text_started` gates opening one to the leading edge of the answer;
+            // `saw_think_tag` tracks whether a <think>/</think> tag or dedicated
+            // reasoning field has already been processed so prefilled </think>
+            // scanning stops once the thought block is done.
             let mut carry = String::new();
             let mut in_think = false;
             let mut text_started = false;
+            let mut saw_think_tag = false;
+            let mut last_emitted_char: Option<char> = None;
             let mut reasoning_emitted_len: usize = 0;
             let mut delta_emitted_len: usize = 0;
 
@@ -773,24 +870,37 @@ impl Provider for LmStudioProvider {
                     }
                 };
 
-                let Some(chunk) = next_chunk else { break 'outer };
-                started = true;
-                let b = match chunk {
-                    Ok(b) => b,
-                    Err(e) => {
+                let reached_eof = match next_chunk {
+                    Some(Ok(b)) => {
+                        started = true;
+                        buf.extend_from_slice(&b);
+                        false
+                    }
+                    Some(Err(e)) => {
                         yield StreamEvent::Error { message: format!("stream error: {e}") };
                         return;
                     }
+                    None => {
+                        if buf.is_empty() {
+                            break 'outer;
+                        }
+                        buf.push(b'\n');
+                        true
+                    }
                 };
-                buf.extend_from_slice(&b);
 
                 // SSE frames are newline-delimited; drain complete lines.
                 while let Some(nl) = buf.iter().position(|&c| c == b'\n') {
                     let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
                     let line = String::from_utf8_lossy(&line_bytes);
                     let line = line.trim();
-                    let Some(data) = line.strip_prefix("data:") else { continue };
-                    let data = data.trim();
+                    let data = if let Some(d) = line.strip_prefix("data:") {
+                        d.trim()
+                    } else if line.starts_with('{') && line.contains("\"error\"") {
+                        line
+                    } else {
+                        continue;
+                    };
                     if data == "[DONE]" {
                         break 'outer;
                     }
@@ -810,8 +920,8 @@ impl Provider for LmStudioProvider {
                     // serves every other provider, so it needed it more.
                     if let Some(err) = v.get("error") {
                         let message = err
-                            .get("message")
-                            .and_then(|m| m.as_str())
+                            .as_str()
+                            .or_else(|| err.get("message").and_then(|m| m.as_str()))
                             .unwrap_or("the provider reported an error mid-response");
 
                         match classify_engine_error(message) {
@@ -839,6 +949,7 @@ impl Provider for LmStudioProvider {
                                                     id: if t.id.is_empty() { format!("call_{i}") } else { t.id },
                                                     name: t.name,
                                                     arguments: valid_args,
+                                                    extra_content: t.extra_content,
                                                 },
                                                 t.started,
                                             ));
@@ -861,12 +972,13 @@ impl Provider for LmStudioProvider {
 
                                 // If we have at least one valid tool call, finish the round successfully!
                                 if !valid_tools.is_empty() {
-                                    if sequential && valid_tools.len() > 1 {
-                                        eprintln!(
-                                            "[lmstudio] truncating {} salvaged tool calls to 1 (sequential active)",
-                                            valid_tools.len()
-                                        );
-                                        valid_tools.truncate(1);
+                                    if !carry.is_empty() {
+                                        let leftover = std::mem::take(&mut carry);
+                                        yield if in_think {
+                                            StreamEvent::Reasoning { text: leftover }
+                                        } else {
+                                            StreamEvent::Delta { text: leftover }
+                                        };
                                     }
                                     eprintln!(
                                         "[lmstudio] salvaged {} valid tool calls from diff parser error: {:?}",
@@ -890,7 +1002,6 @@ impl Provider for LmStudioProvider {
                                     fallback_url,
                                     fallback_api_key,
                                     fallback_body_map,
-                                    sequential,
                                     reasoning_emitted_len,
                                     delta_emitted_len,
                                 );
@@ -917,6 +1028,7 @@ impl Provider for LmStudioProvider {
                         .or_else(|| v["choices"][0]["delta"]["thought"].as_str())
                     {
                         if !rtext.is_empty() {
+                            saw_think_tag = true;
                             reasoning_emitted_len += rtext.len();
                             yield StreamEvent::Reasoning { text: rtext.to_string() };
                         }
@@ -925,15 +1037,40 @@ impl Provider for LmStudioProvider {
                         if !text.is_empty() {
                             carry.push_str(text);
                             let mut out = Vec::new();
-                            push_split(&mut out, &mut carry, &mut in_think, &mut text_started);
+                            push_split(
+                                &mut out,
+                                &mut carry,
+                                &mut in_think,
+                                &mut text_started,
+                                &mut saw_think_tag,
+                                &mut last_emitted_char,
+                            );
                             for ev in out {
                                 match &ev {
                                     StreamEvent::Reasoning { text } => reasoning_emitted_len += text.len(),
                                     StreamEvent::Delta { text } => delta_emitted_len += text.len(),
+                                    StreamEvent::PromoteToReasoning => {
+                                        reasoning_emitted_len += delta_emitted_len;
+                                        delta_emitted_len = 0;
+                                    }
                                     _ => {}
                                 }
                                 yield ev;
                             }
+                        }
+                    }
+
+                    // Extract any delta-level extra_content (e.g. Gemini thought_signature)
+                    if let Some(delta) = v.get("choices").and_then(|c| c.get(0)).and_then(|c| c.get("delta")) {
+                        if let Some(extra) = extract_extra_content(delta) {
+                            if !tools_acc.is_empty() {
+                                if let Some(last_slot) = tools_acc.last_mut() {
+                                    if last_slot.extra_content.is_none() {
+                                        last_slot.extra_content = Some(extra.clone());
+                                    }
+                                }
+                            }
+                            pending_extra_content = Some(extra);
                         }
                     }
 
@@ -956,6 +1093,12 @@ impl Provider for LmStudioProvider {
                             }
                             let tool_start = {
                                 let slot = &mut tools_acc[idx];
+                                if let Some(extra) = extract_extra_content(tcd)
+                                    .or_else(|| tcd.get("function").and_then(extract_extra_content))
+                                    .or_else(|| pending_extra_content.clone())
+                                {
+                                    slot.extra_content = Some(extra);
+                                }
                                 if let Some(id) = tcd.get("id").and_then(Value::as_str) {
                                     if !id.is_empty() {
                                         slot.id = id.to_string();
@@ -988,10 +1131,14 @@ impl Provider for LmStudioProvider {
                         }
                     }
 
-                    if let Some(reason) = v["choices"][0]["finish_reason"].as_str() {
+                    if let Some(reason) = v["choices"][0]["finish_reason"].as_str().filter(|s| !s.is_empty()) {
                         finish_reason = Some(reason.to_string());
                         break 'outer;
                     }
+                }
+
+                if reached_eof {
+                    break 'outer;
                 }
             }
 
@@ -1002,11 +1149,6 @@ impl Provider for LmStudioProvider {
                 } else {
                     StreamEvent::Delta { text: carry }
                 };
-            }
-
-            // Enforce sequential tool calls if enabled: truncate to 1 call
-            if sequential && tools_acc.len() > 1 {
-                tools_acc.truncate(1);
             }
 
             // Flush any accumulated tool calls, then signal completion.
@@ -1023,12 +1165,13 @@ impl Provider for LmStudioProvider {
                 let arguments = if slot.arguments.trim().is_empty() {
                     "{}".to_string()
                 } else {
-                    slot.arguments
+                    extract_valid_json_args(&slot.arguments).unwrap_or(slot.arguments)
                 };
                 yield StreamEvent::ToolCall(ToolCall {
                     id,
                     name: slot.name,
                     arguments,
+                    extra_content: slot.extra_content,
                 });
             }
             let final_finish = finish_reason.or_else(|| {
@@ -1074,10 +1217,19 @@ mod think_split_tests {
         let mut carry = String::new();
         let mut in_think = false;
         let mut text_started = false;
+        let mut saw_think_tag = false;
+        let mut last_emitted_char = None;
         let mut out = Vec::new();
         for c in chunks {
             carry.push_str(c);
-            push_split(&mut out, &mut carry, &mut in_think, &mut text_started);
+            push_split(
+                &mut out,
+                &mut carry,
+                &mut in_think,
+                &mut text_started,
+                &mut saw_think_tag,
+                &mut last_emitted_char,
+            );
         }
         if !carry.is_empty() {
             out.push(if in_think {
@@ -1091,6 +1243,9 @@ mod think_split_tests {
             match ev {
                 StreamEvent::Reasoning { text } => reasoning.push_str(&text),
                 StreamEvent::Delta { text } => answer.push_str(&text),
+                StreamEvent::PromoteToReasoning => {
+                    reasoning.push_str(&std::mem::take(&mut answer));
+                }
                 _ => {}
             }
         }
@@ -1139,6 +1294,27 @@ mod think_split_tests {
         let (r, a) = split(&["\n<think>r</think>a"]);
         assert_eq!(r, "r");
         assert_eq!(a, "a");
+    }
+
+    #[test]
+    fn prefilled_closing_think_promotes_to_reasoning() {
+        let (r, a) = split(&["thinking inside prefill", "</think>", "final answer"]);
+        assert_eq!(r, "thinking inside prefill");
+        assert_eq!(a, "final answer");
+    }
+
+    #[test]
+    fn prefilled_closing_think_split_across_chunks() {
+        let (r, a) = split(&["started in ", "prefill</thi", "nk>actual reply"]);
+        assert_eq!(r, "started in prefill");
+        assert_eq!(a, "actual reply");
+    }
+
+    #[test]
+    fn quoted_closing_think_stays_literal_text() {
+        let (r, a) = split(&["In Qwen templates, `", "</think>", "` closes the block."]);
+        assert_eq!(r, "");
+        assert_eq!(a, "In Qwen templates, `</think>` closes the block.");
     }
 }
 
@@ -1281,32 +1457,6 @@ mod openai_shape_tests {
     }
 
     #[test]
-    fn chat_request_deserializes_sequential_tool_calls() {
-        let json_data = serde_json::json!({
-            "model": "ling-3.0-tiny",
-            "messages": [],
-            "sequential_tool_calls": true
-        });
-        let req: crate::provider::ChatRequest = serde_json::from_value(json_data).unwrap();
-        assert_eq!(req.sequential_tool_calls, Some(true));
-
-        let json_data_false = serde_json::json!({
-            "model": "ling-3.0-tiny",
-            "messages": [],
-            "sequential_tool_calls": false
-        });
-        let req_false: crate::provider::ChatRequest = serde_json::from_value(json_data_false).unwrap();
-        assert_eq!(req_false.sequential_tool_calls, Some(false));
-
-        let json_data_none = serde_json::json!({
-            "model": "ling-3.0-tiny",
-            "messages": []
-        });
-        let req_none: crate::provider::ChatRequest = serde_json::from_value(json_data_none).unwrap();
-        assert_eq!(req_none.sequential_tool_calls, None);
-    }
-
-    #[test]
     fn test_safe_unemitted_suffix() {
         use super::safe_unemitted_suffix;
 
@@ -1412,4 +1562,152 @@ mod openai_shape_tests {
         assert_eq!(tools[0].name, "read_file");
         assert_eq!(tools[0].arguments, "{\"path\":\"pyproject.toml\"}");
     }
+
+    #[test]
+    fn test_error_unwrapping_string_or_object() {
+        use serde_json::Value;
+        let string_err: Value = serde_json::from_str(r#"{"error": "Engine protocol predict stream returned an error: foo"}"#).unwrap();
+        let err_val = string_err.get("error").unwrap();
+        let message = err_val
+            .as_str()
+            .or_else(|| err_val.get("message").and_then(|m| m.as_str()))
+            .unwrap_or("the provider reported an error mid-response");
+        assert_eq!(message, "Engine protocol predict stream returned an error: foo");
+
+        let obj_err: Value = serde_json::from_str(r#"{"error": {"message": "context length exceeded"}}"#).unwrap();
+        let err_val = obj_err.get("error").unwrap();
+        let message = err_val
+            .as_str()
+            .or_else(|| err_val.get("message").and_then(|m| m.as_str()))
+            .unwrap_or("the provider reported an error mid-response");
+        assert_eq!(message, "context length exceeded");
+    }
+
+    #[test]
+    fn test_extract_valid_json_args_on_trailing_tokens() {
+        use super::extract_valid_json_args;
+        let with_im_end = r#"{"path":"src/main.rs"}<|im_end|>"#;
+        assert_eq!(
+            extract_valid_json_args(with_im_end).unwrap_or(with_im_end.to_string()),
+            r#"{"path":"src/main.rs"}"#
+        );
+        let valid_json = r#"{"path":"src/main.rs"}"#;
+        assert_eq!(
+            extract_valid_json_args(valid_json).unwrap_or(valid_json.to_string()),
+            r#"{"path":"src/main.rs"}"#
+        );
+    }
+
+    #[test]
+    fn test_extract_extra_content_variants() {
+        use super::extract_extra_content;
+
+        // 1. Nested Google format
+        let google_nested = serde_json::json!({
+            "extra_content": {
+                "google": {
+                    "thought_signature": "sig_google_123"
+                }
+            }
+        });
+        let res = extract_extra_content(&google_nested).expect("should extract google extra_content");
+        assert_eq!(res["google"]["thought_signature"], "sig_google_123");
+
+        // 2. Flat thought_signature
+        let flat_sig = serde_json::json!({
+            "thought_signature": "sig_flat_456"
+        });
+        let res = extract_extra_content(&flat_sig).expect("should extract flat thought_signature");
+        assert_eq!(res["google"]["thought_signature"], "sig_flat_456");
+
+        // 3. Flat camelCase thoughtSignature
+        let camel_sig = serde_json::json!({
+            "thoughtSignature": "sig_camel_789"
+        });
+        let res = extract_extra_content(&camel_sig).expect("should extract camelCase thoughtSignature");
+        assert_eq!(res["google"]["thought_signature"], "sig_camel_789");
+
+        // 4. extra_content with flat thought_signature normalized to google.thought_signature
+        let bare_extra = serde_json::json!({
+            "extra_content": {
+                "thought_signature": "sig_bare_abc"
+            }
+        });
+        let res = extract_extra_content(&bare_extra).expect("should normalize bare extra_content");
+        assert_eq!(res["google"]["thought_signature"], "sig_bare_abc");
+
+        // 5. provider_specific_fields
+        let psf = serde_json::json!({
+            "provider_specific_fields": {
+                "thought_signature": "sig_psf_def"
+            }
+        });
+        let res = extract_extra_content(&psf).expect("should extract from provider_specific_fields");
+        assert_eq!(res["google"]["thought_signature"], "sig_psf_def");
+
+        // 6. Non-signature payload returns None
+        let plain = serde_json::json!({
+            "role": "assistant",
+            "content": "hello"
+        });
+        assert!(extract_extra_content(&plain).is_none());
+    }
+
+    #[test]
+    fn test_to_openai_messages_preserves_extra_content_on_tool_calls() {
+        use crate::provider::{Message, Role, ToolCall};
+        use super::to_openai_messages;
+
+        let tc_with_sig = ToolCall {
+            id: "call_gemini_1".into(),
+            name: "default_api:list_dir".into(),
+            arguments: r#"{"dir":"."}"#.into(),
+            extra_content: Some(serde_json::json!({
+                "google": {
+                    "thought_signature": "EpoGCpcGAXLI2nx/test_sig"
+                }
+            })),
+        };
+
+        let tc_plain = ToolCall {
+            id: "call_openai_2".into(),
+            name: "run_command".into(),
+            arguments: r#"{"command":"dir"}"#.into(),
+            extra_content: None,
+        };
+
+        let msgs = vec![
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                images: Vec::new(),
+                tool_calls: vec![tc_with_sig, tc_plain],
+                tool_call_id: None,
+                created_at: None,
+                reasoning: None,
+                reasoning_signature: None,
+                sources: Vec::new(),
+                segments: None,
+            },
+        ];
+
+        let wire = to_openai_messages(&msgs);
+        assert_eq!(wire.len(), 1);
+        let calls = wire[0]["tool_calls"].as_array().expect("tool_calls must be an array");
+        assert_eq!(calls.len(), 2);
+
+        // Tool call 1: must include extra_content with thought_signature
+        assert_eq!(
+            calls[0]["extra_content"]["google"]["thought_signature"],
+            "EpoGCpcGAXLI2nx/test_sig"
+        );
+        assert_eq!(calls[0]["id"], "call_gemini_1");
+        assert_eq!(calls[0]["function"]["name"], "default_api:list_dir");
+
+        // Tool call 2: must omit extra_content entirely
+        assert!(calls[1].get("extra_content").is_none());
+        assert_eq!(calls[1]["id"], "call_openai_2");
+        assert_eq!(calls[1]["function"]["name"], "run_command");
+    }
 }
+

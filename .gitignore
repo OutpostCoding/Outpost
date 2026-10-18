@@ -10,6 +10,8 @@ releases/
 .claude/
 archive/
 NOTES.md
+evals/
+benchmarks/
 
 # --- merged from the former frontend/.gitignore ---
 

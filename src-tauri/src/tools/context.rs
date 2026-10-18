@@ -159,10 +159,13 @@ pub fn number_lines(content: &str) -> String {
 pub(crate) fn read_text_capped(path: &Path) -> Result<String, String> {
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
     if let Ok(meta) = std::fs::metadata(path) {
+        if meta.is_dir() {
+            return Err("is a directory — use list_dir to inspect folders".into());
+        }
         if meta.len() > MAX_BYTES {
             return Err(format!(
                 "it is {:.1} MB, too large to read whole (limit {} MB) — use grep_search to \
-                 find what you need inside it, or read_file_lines for a range",
+                 find what you need inside it, or pass start and lines to read_file for a range",
                 meta.len() as f64 / 1_048_576.0,
                 MAX_BYTES / 1_048_576
             ));

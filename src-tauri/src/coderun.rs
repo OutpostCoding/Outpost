@@ -32,10 +32,13 @@ impl CodeRuns {
         self.next.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Register a pending run; await the returned receiver for its output.
+    /// Register a pending run; await the returned receiver for its output. Prunes
+    /// closed oneshot senders whose receivers dropped (e.g. timeout or cancelled tool call).
     pub fn register(&self, id: u64) -> oneshot::Receiver<String> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        let mut map = self.pending.lock().unwrap();
+        map.retain(|_, sender| !sender.is_closed());
+        map.insert(id, tx);
         rx
     }
 
@@ -45,5 +48,11 @@ impl CodeRuns {
         if let Some(tx) = self.pending.lock().unwrap().remove(&id) {
             let _ = tx.send(output);
         }
+    }
+
+    /// Clear all pending code runs, dropping their senders so any blocked
+    /// receiver immediately wakes with RecvError (used when stopping a turn).
+    pub fn clear(&self) {
+        self.pending.lock().unwrap().clear();
     }
 }

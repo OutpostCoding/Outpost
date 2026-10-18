@@ -31,10 +31,13 @@ impl Approvals {
     }
 
     /// Register a pending decision; await the receiver for the outcome string
-    /// ("approve" | "reject" | "rename").
+    /// ("approve" | "reject" | "rename"). Prunes closed oneshot senders whose receivers
+    /// dropped (e.g. timeout or cancelled tool call) to prevent memory accumulation.
     pub fn register(&self, id: u64) -> oneshot::Receiver<String> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        let mut map = self.pending.lock().unwrap();
+        map.retain(|_, sender| !sender.is_closed());
+        map.insert(id, tx);
         rx
     }
 
@@ -44,6 +47,12 @@ impl Approvals {
         if let Some(tx) = self.pending.lock().unwrap().remove(&id) {
             let _ = tx.send(decision);
         }
+    }
+
+    /// Clear all pending approval gates, dropping their senders so any blocked
+    /// receiver immediately wakes with RecvError (used when stopping a turn).
+    pub fn clear(&self) {
+        self.pending.lock().unwrap().clear();
     }
 }
 
