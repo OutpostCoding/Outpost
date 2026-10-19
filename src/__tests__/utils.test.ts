@@ -243,6 +243,7 @@ describe("toolTitle", () => {
     expect(toolTitle("project_changes", "{}")).toBe("changes this session");
     expect(toolTitle("read_image", '{"path":"ui.png"}')).toBe("read image: ui.png");
     expect(toolTitle("typecheck", "{}")).toBe("typecheck");
+    expect(toolTitle("typecheck", '{"target":"ts"}')).toBe("typecheck: ts");
     expect(toolTitle("read_file", '{"path":"src/App.tsx"}')).toBe("read: src/App.tsx");
     expect(toolTitle("read_file", '{"path":"src/App.tsx","start":1190,"lines":60}')).toBe("read src/App.tsx (L1190–1249)");
     expect(toolTitle("read_file_lines", '{"path":"src/App.tsx","start":1190,"lines":60}')).toBe("read src/App.tsx (L1190–1249)");

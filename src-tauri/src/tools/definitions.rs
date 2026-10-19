@@ -220,10 +220,15 @@ description: "Search the user's markdown notes by keyword — their written mate
             },
             Tool {
                 name: "typecheck".into(),
-                description: "Run the project's static typechecker or syntax validator ONCE: `tsc --noEmit` for TypeScript (root or `frontend`/`client`/`web`/`ui` subdirectory), `cargo check` for Rust (root or `src-tauri/` nested crate), `go vet ./...` for Go, `dotnet build` for C#/.NET, or `compileall` for Python (runs all that match). A cheap post-edit sanity pass — call it after a batch of edits to catch syntax and type errors before running the app. The command is fixed and takes no arguments, so it runs without prompting; results are capped like run_command. For languages with no compiler-style checker it says so instead of guessing. Takes no arguments.".into(),
+                description: "Run the project's static typechecker or syntax validator: `tsc --noEmit` for TypeScript (root or `frontend`/`client`/`web`/`ui` subdirectory), `cargo check` for Rust (root or `src-tauri/` nested crate), `go vet ./...` for Go, `dotnet build` for C#/.NET, or `compileall` for Python. Call with no arguments to check all detected toolchains, or pass 'target' (e.g. 'ts' or 'rust') to run only that specific check. A cheap post-edit sanity pass — call it after a batch of edits to catch syntax and type errors before running the app. The command is fixed and runs without prompting; results are capped like run_command. For languages with no compiler-style checker it says so instead of guessing.".into(),
                 parameters: json!({
                     "type": "object",
-                    "properties": {}
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "Optional toolchain or language to check ('ts'/'typescript', 'rust'/'cargo', 'py'/'python', 'go', 'dotnet' or a path). Omit to check all detected toolchains in the project."
+                        }
+                    }
                 }),
             },
             Tool {

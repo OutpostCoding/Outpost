@@ -294,7 +294,7 @@ impl Tools {
                 self.run_command(&call.arguments, project_root, cancel, on_event)
                     .await
             }
-            "typecheck" => self.typecheck(project_root, cancel).await,
+            "typecheck" => self.typecheck(&call.arguments, project_root, cancel).await,
             "process_manage" => {
                 self.process_manage(&call.arguments, cancel).await
             }

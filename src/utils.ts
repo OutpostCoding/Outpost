@@ -751,8 +751,10 @@ export function toolTitle(name: string, args: string): string {
     case "find_symbols":
     case "code_symbols":
       return at("symbols", s("path"));
-    case "typecheck":
-      return "typecheck";
+    case "typecheck": {
+      const t = s("target") || s("lang") || s("area") || s("toolchain");
+      return t ? `typecheck: ${t}` : "typecheck";
+    }
     case "godot_scene_tree":
       return at("scene tree", s("scene") || s("path"));
     case "write_file":

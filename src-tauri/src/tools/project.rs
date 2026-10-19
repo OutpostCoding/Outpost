@@ -701,6 +701,81 @@ impl Tools {
         }
     }
 
+    /// Expands shell/glob brace alternatives like `*.{ts,tsx}` or `{Cargo.toml,tauri.conf.json}`
+    /// into individual glob strings so `glob::Pattern` (which does not natively support `{a,b}`)
+    /// matches correctly. Handles nested and multiple brace groups recursively.
+    pub(crate) fn expand_braces(pattern: &str) -> Vec<String> {
+        let mut depth = 0;
+        let mut start_idx = None;
+        let mut has_comma_at_depth_1 = false;
+        let mut end_idx = None;
+
+        for (i, c) in pattern.char_indices() {
+            match c {
+                '{' => {
+                    if depth == 0 {
+                        start_idx = Some(i);
+                        has_comma_at_depth_1 = false;
+                    }
+                    depth += 1;
+                }
+                '}' => {
+                    if depth > 0 {
+                        depth -= 1;
+                        if depth == 0 && start_idx.is_some() {
+                            if has_comma_at_depth_1 {
+                                end_idx = Some(i);
+                                break;
+                            } else {
+                                start_idx = None;
+                            }
+                        }
+                    }
+                }
+                ',' => {
+                    if depth == 1 {
+                        has_comma_at_depth_1 = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let (Some(start), Some(end)) = (start_idx, end_idx) {
+            let prefix = &pattern[..start];
+            let suffix = &pattern[end + 1..];
+            let inner = &pattern[start + 1..end];
+
+            let mut parts = Vec::new();
+            let mut cur_part = String::new();
+            let mut inner_depth = 0;
+            for c in inner.chars() {
+                if c == '{' {
+                    inner_depth += 1;
+                    cur_part.push(c);
+                } else if c == '}' {
+                    if inner_depth > 0 {
+                        inner_depth -= 1;
+                    }
+                    cur_part.push(c);
+                } else if c == ',' && inner_depth == 0 {
+                    parts.push(cur_part);
+                    cur_part = String::new();
+                } else {
+                    cur_part.push(c);
+                }
+            }
+            parts.push(cur_part);
+
+            return parts
+                .into_iter()
+                .flat_map(|part| Self::expand_braces(&format!("{prefix}{part}{suffix}")))
+                .collect();
+        }
+
+        vec![pattern.to_string()]
+    }
+
     /// Pure core of `project_search` — an associated fn (no host state) so the
     /// search logic is unit-testable without a Tauri AppHandle.
     pub(crate) fn run_project_search(arguments: &str, root: &Path) -> String {
@@ -853,12 +928,19 @@ impl Tools {
             }
         });
         let glob_norm = glob.as_deref().map(|g| g.replace('\\', "/"));
-        let glob_pat = match glob_norm.as_deref() {
-            Some(g) => match glob::Pattern::new(g) {
-                Ok(p) => Some(p),
-                Err(e) => return format!("error: invalid glob '{g}': {e}"),
-            },
-            None => None,
+        let glob_pats: Vec<(glob::Pattern, String)> = match glob_norm.as_deref() {
+            Some(g) => {
+                let expanded = Self::expand_braces(g);
+                let mut pats = Vec::with_capacity(expanded.len());
+                for pat_str in expanded {
+                    match glob::Pattern::new(&pat_str) {
+                        Ok(p) => pats.push((p, pat_str)),
+                        Err(e) => return format!("error: invalid glob '{g}': {e}"),
+                    }
+                }
+                pats
+            }
+            None => Vec::new(),
         };
 
         // Adaptive caps:
@@ -905,15 +987,16 @@ impl Tools {
                 }
             }
             path_matched += 1;
-            if let Some(g) = &glob_pat {
-                let raw = glob_norm.as_deref().unwrap_or("");
-                let matched = g.matches(rel)
-                    || (!raw.contains('/')
-                        && Path::new(rel)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .map(|n| g.matches(n))
-                            .unwrap_or(false));
+            if !glob_pats.is_empty() {
+                let matched = glob_pats.iter().any(|(g, raw)| {
+                    g.matches(rel)
+                        || (!raw.contains('/')
+                            && Path::new(rel)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|n| g.matches(n))
+                                .unwrap_or(false))
+                });
                 if !matched {
                     continue;
                 }
@@ -1016,7 +1099,7 @@ impl Tools {
                         path_filter.as_deref().unwrap_or("")
                     );
                 }
-                if glob_pat.is_some() && glob_matched == 0 {
+                if !glob_pats.is_empty() && glob_matched == 0 {
                     return format!(
                         "Glob '{}' matched no files in the project.",
                         glob.as_deref().unwrap_or("")
@@ -1058,7 +1141,7 @@ impl Tools {
                     path_filter.as_deref().unwrap_or("")
                 );
             }
-            if glob_pat.is_some() && glob_matched == 0 {
+            if !glob_pats.is_empty() && glob_matched == 0 {
                 return format!(
                     "Glob '{}' matched no files, so nothing could be searched. Try a \
                      looser glob (e.g. '*.ts', 'src/**/*.rs') or drop it.",
@@ -2172,12 +2255,15 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
     }
 
     /// `typecheck` — run the project's static typechecker or syntax validator once. Deliberately NOT
-    /// approval-gated: the command is FIXED (no model-supplied arguments), so the
+    /// approval-gated: the command is FIXED (no arbitrary shell injection), so the
     /// closed verb set is the safety — there is nothing to review, unlike
     /// run_command. The posture is reported in the head block (§3.1). Never
     /// interactive: `npx --no-install` fails fast instead of prompting to fetch
     /// typescript, and the 300s ceiling covers a first `cargo check`.
-    pub(crate) async fn run_typecheck(project_root: Option<&Path>, cancel: &CancellationToken) -> String {
+    ///
+    /// Accepts an optional `target` in `arguments` (e.g. "ts" or "rust") to run only
+    /// that specific toolchain. When omitted or empty, all detected toolchains run.
+    pub(crate) async fn run_typecheck(arguments: &str, project_root: Option<&Path>, cancel: &CancellationToken) -> String {
         let Some(root) = project_root else {
             return "error: no project is open — typecheck needs an active coding session.".into();
         };
@@ -2191,11 +2277,15 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
             checks.push(TypeCheck {
                 command: "cargo check".into(),
                 working_dir: root.to_path_buf(),
+                lang: "rust",
+                display_name: "Rust",
             });
         } else if root.join("src-tauri/Cargo.toml").exists() {
             checks.push(TypeCheck {
                 command: "cargo check".into(),
                 working_dir: root.join("src-tauri"),
+                lang: "rust",
+                display_name: "Rust",
             });
         }
 
@@ -2214,6 +2304,8 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
             checks.push(TypeCheck {
                 command: "npx --no-install tsc --noEmit".into(),
                 working_dir: dir,
+                lang: "typescript",
+                display_name: "TypeScript",
             });
         }
 
@@ -2222,6 +2314,8 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
             checks.push(TypeCheck {
                 command: "go vet ./...".into(),
                 working_dir: root.to_path_buf(),
+                lang: "go",
+                display_name: "Go",
             });
         }
 
@@ -2236,6 +2330,8 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
             checks.push(TypeCheck {
                 command: "dotnet build".into(),
                 working_dir: root.to_path_buf(),
+                lang: "dotnet",
+                display_name: "C#/.NET",
             });
         }
 
@@ -2289,6 +2385,8 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
             checks.push(TypeCheck {
                 command: py_cmd.to_string(),
                 working_dir: root.to_path_buf(),
+                lang: "python",
+                display_name: "Python",
             });
         }
 
@@ -2298,8 +2396,50 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
             }
             return "no typechecker for this project — typecheck runs `tsc --noEmit` (TypeScript), `cargo check` (Rust), `go vet ./...` (Go), `dotnet build` (C#/.NET), or `compileall` (Python).".into();
         }
+
+        let parsed = serde_json::from_str::<Value>(arguments).ok();
+        let target_raw = parsed
+            .as_ref()
+            .and_then(|v| {
+                v.get("target")
+                    .or_else(|| v.get("lang"))
+                    .or_else(|| v.get("language"))
+                    .or_else(|| v.get("area"))
+                    .or_else(|| v.get("toolchain"))
+                    .or_else(|| v.get("path"))
+                    .and_then(|t| t.as_str())
+                    .or_else(|| v.as_str())
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                let trimmed = arguments.trim().trim_matches('"');
+                if !trimmed.is_empty() && !trimmed.starts_with('{') {
+                    Some(trimmed)
+                } else {
+                    None
+                }
+            });
+
+        let checks_to_run: Vec<&TypeCheck> = if let Some(target) = target_raw {
+            let matched: Vec<&TypeCheck> = checks
+                .iter()
+                .filter(|c| Self::check_matches_target(c, target))
+                .collect();
+            if matched.is_empty() {
+                let available: Vec<&str> = checks.iter().map(|c| c.display_name).collect();
+                return format!(
+                    "target '{target}' not found in detected toolchains for this project. Available toolchains: {}.",
+                    available.join(", ")
+                );
+            }
+            matched
+        } else {
+            checks.iter().collect()
+        };
+
         let mut results = Vec::new();
-        for check in &checks {
+        for check in checks_to_run {
             let mut cmd = {
                 #[cfg(windows)]
                 {
@@ -2335,8 +2475,39 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
         results.join("\n\n")
     }
 
-    pub(crate) async fn typecheck(&self, project_root: Option<&Path>, cancel: &CancellationToken) -> String {
-        Self::run_typecheck(project_root, cancel).await
+    fn check_matches_target(check: &TypeCheck, target: &str) -> bool {
+        let t = target.trim().to_ascii_lowercase();
+        let t = t.trim_start_matches('.').trim_end_matches('/');
+
+        match check.lang {
+            "rust" => {
+                matches!(t, "rust" | "rs" | "cargo" | "backend" | "src-tauri" | "tauri")
+                    || check.working_dir.to_string_lossy().to_ascii_lowercase().ends_with(t)
+                    || check.command.contains(t)
+            }
+            "typescript" => {
+                matches!(t, "typescript" | "ts" | "tsx" | "js" | "javascript" | "frontend" | "client" | "web" | "ui" | "tsc")
+                    || check.working_dir.to_string_lossy().to_ascii_lowercase().ends_with(t)
+                    || check.command.contains(t)
+            }
+            "go" => {
+                matches!(t, "go" | "golang" | "vet")
+                    || check.command.contains(t)
+            }
+            "dotnet" => {
+                matches!(t, "dotnet" | "c#" | "csharp" | "cs" | ".net")
+                    || check.command.contains(t)
+            }
+            "python" => {
+                matches!(t, "python" | "py" | "compileall")
+                    || check.command.contains(t)
+            }
+            _ => check.lang.eq_ignore_ascii_case(t) || check.command.contains(t),
+        }
+    }
+
+    pub(crate) async fn typecheck(&self, arguments: &str, project_root: Option<&Path>, cancel: &CancellationToken) -> String {
+        Self::run_typecheck(arguments, project_root, cancel).await
     }
 
 
@@ -2349,6 +2520,8 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
 struct TypeCheck {
     command: String,
     working_dir: PathBuf,
+    lang: &'static str,
+    display_name: &'static str,
 }
 
 // --- Post-edit syntax check --------------------------------------------------
@@ -3600,7 +3773,7 @@ mod project_tests {
         .unwrap();
 
         let cancel = CancellationToken::new();
-        let out = Tools::run_typecheck(Some(&temp_dir), &cancel).await;
+        let out = Tools::run_typecheck("", Some(&temp_dir), &cancel).await;
 
         assert!(
             out.contains("compileall"),
@@ -3631,7 +3804,7 @@ mod project_tests {
         .unwrap();
 
         let cancel = CancellationToken::new();
-        let out = Tools::run_typecheck(Some(&temp_dir), &cancel).await;
+        let out = Tools::run_typecheck("", Some(&temp_dir), &cancel).await;
 
         assert!(
             out.contains("compileall"),
@@ -3664,7 +3837,7 @@ mod project_tests {
         assert!(!temp_dir.join("Cargo.toml").exists());
 
         let cancel = CancellationToken::new();
-        let out = Tools::run_typecheck(Some(&temp_dir), &cancel).await;
+        let out = Tools::run_typecheck("", Some(&temp_dir), &cancel).await;
 
         assert!(
             out.contains("cargo check"),
@@ -3691,7 +3864,7 @@ mod project_tests {
         .unwrap();
 
         let cancel = CancellationToken::new();
-        let out = Tools::run_typecheck(Some(&temp_dir), &cancel).await;
+        let out = Tools::run_typecheck("", Some(&temp_dir), &cancel).await;
 
         assert!(
             out.contains("go vet"),
@@ -3718,7 +3891,7 @@ mod project_tests {
         .unwrap();
 
         let cancel = CancellationToken::new();
-        let out = Tools::run_typecheck(Some(&temp_dir), &cancel).await;
+        let out = Tools::run_typecheck("", Some(&temp_dir), &cancel).await;
 
         assert!(
             out.contains("dotnet build"),
@@ -3747,7 +3920,7 @@ mod project_tests {
         assert!(!temp_dir.join("tsconfig.json").exists());
 
         let cancel = CancellationToken::new();
-        let out = Tools::run_typecheck(Some(&temp_dir), &cancel).await;
+        let out = Tools::run_typecheck("", Some(&temp_dir), &cancel).await;
 
         assert!(
             out.contains("tsc --noEmit"),
@@ -3775,7 +3948,7 @@ mod project_tests {
         .unwrap();
 
         let cancel = CancellationToken::new();
-        let out = Tools::run_typecheck(Some(&temp_dir), &cancel).await;
+        let out = Tools::run_typecheck("", Some(&temp_dir), &cancel).await;
 
         assert!(
             out.contains("cargo check"),
@@ -3785,6 +3958,117 @@ mod project_tests {
             out.contains("tsc --noEmit"),
             "polyglot typecheck should run tsc --noEmit, got:\n{out}"
         );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_expand_braces() {
+        assert_eq!(
+            Tools::expand_braces("{Cargo.toml,tauri.conf.json}"),
+            vec!["Cargo.toml", "tauri.conf.json"]
+        );
+        assert_eq!(
+            Tools::expand_braces("*.{ts,tsx}"),
+            vec!["*.ts", "*.tsx"]
+        );
+        assert_eq!(
+            Tools::expand_braces("src/{components,utils}/**/*.{ts,tsx}"),
+            vec![
+                "src/components/**/*.ts",
+                "src/components/**/*.tsx",
+                "src/utils/**/*.ts",
+                "src/utils/**/*.tsx",
+            ]
+        );
+        assert_eq!(
+            Tools::expand_braces("src/*.rs"),
+            vec!["src/*.rs"]
+        );
+        assert_eq!(
+            Tools::expand_braces("{no_comma}"),
+            vec!["{no_comma}"]
+        );
+        assert_eq!(
+            Tools::expand_braces("{}"),
+            vec!["{}"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_typecheck_targeted_filtering() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "outpost_typecheck_targeted_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("src-tauri")).unwrap();
+        std::fs::write(temp_dir.join("tsconfig.json"), "{}").unwrap();
+        std::fs::write(
+            temp_dir.join("src-tauri/Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+
+        let cancel = CancellationToken::new();
+
+        // 1. Target TypeScript only
+        let ts_out = Tools::run_typecheck(r#"{"target": "ts"}"#, Some(&temp_dir), &cancel).await;
+        assert!(ts_out.contains("tsc --noEmit"), "should run tsc: {ts_out}");
+        assert!(!ts_out.contains("cargo check"), "must not run cargo check: {ts_out}");
+
+        // 2. Target Rust only
+        let rust_out = Tools::run_typecheck(r#"{"target": "rust"}"#, Some(&temp_dir), &cancel).await;
+        assert!(rust_out.contains("cargo check"), "should run cargo check: {rust_out}");
+        assert!(!rust_out.contains("tsc --noEmit"), "must not run tsc: {rust_out}");
+
+        // 3. Target unknown/unconfigured language (e.g. python in rust+ts project)
+        let unk_out = Tools::run_typecheck(r#"{"target": "python"}"#, Some(&temp_dir), &cancel).await;
+        assert!(
+            unk_out.contains("target 'python' not found in detected toolchains"),
+            "should report unknown target: {unk_out}"
+        );
+        assert!(
+            unk_out.contains("Rust") && unk_out.contains("TypeScript"),
+            "should list available toolchains: {unk_out}"
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_project_search_brace_expansion() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "outpost_search_brace_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("Cargo.toml"), "[package]\nname = \"target_app\"\n").unwrap();
+        std::fs::write(temp_dir.join("tauri.conf.json"), "{\n  \"productName\": \"target_app\"\n}\n").unwrap();
+        std::fs::write(temp_dir.join("other.txt"), "target_app\n").unwrap();
+
+        // Filename search with brace glob
+        let name_res = Tools::run_project_search(
+            r#"{"glob": "{Cargo.toml,tauri.conf.json}"}"#,
+            &temp_dir,
+        );
+        assert!(name_res.contains("Cargo.toml"), "name_res should have Cargo.toml: {name_res}");
+        assert!(name_res.contains("tauri.conf.json"), "name_res should have tauri.conf.json: {name_res}");
+        assert!(!name_res.contains("other.txt"), "name_res should not have other.txt: {name_res}");
+
+        // Content search with brace glob
+        let content_res = Tools::run_project_search(
+            r#"{"query": "target_app", "glob": "{Cargo.toml,tauri.conf.json}"}"#,
+            &temp_dir,
+        );
+        assert!(content_res.contains("Cargo.toml"), "content_res should have Cargo.toml: {content_res}");
+        assert!(content_res.contains("tauri.conf.json"), "content_res should have tauri.conf.json: {content_res}");
+        assert!(!content_res.contains("other.txt"), "content_res should not have other.txt: {content_res}");
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

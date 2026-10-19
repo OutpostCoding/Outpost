@@ -1,4 +1,4 @@
-// ── surface: files ────────────────────────────────────
+// ── surface: shared ───────────────────────────────────
 // Syntax highlighting helper for in-drawer code viewer.
 // Exports: highlightCode, getLanguageForPath, splitHighlightedHtml, escapeHtml
 // Related: FilesDrawer.tsx

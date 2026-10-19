@@ -1602,12 +1602,19 @@ fn search_with(
         .filter(|g| !g.trim().is_empty());
 
     let glob_norm = glob_arg.as_deref().map(|g| g.replace('\\', "/"));
-    let glob_pat = match glob_norm.as_deref() {
-        Some(g) => match glob::Pattern::new(g) {
-            Ok(p) => Some(p),
-            Err(e) => return format!("error: invalid glob '{g}': {e}"),
-        },
-        None => None,
+    let glob_pats: Vec<(glob::Pattern, String)> = match glob_norm.as_deref() {
+        Some(g) => {
+            let expanded = Tools::expand_braces(g);
+            let mut pats = Vec::with_capacity(expanded.len());
+            for pat_str in expanded {
+                match glob::Pattern::new(&pat_str) {
+                    Ok(p) => pats.push((p, pat_str)),
+                    Err(e) => return format!("error: invalid glob '{g}': {e}"),
+                }
+            }
+            pats
+        }
+        None => Vec::new(),
     };
 
     let path_norm = path_arg.as_deref().and_then(|p| {
@@ -1647,17 +1654,18 @@ fn search_with(
         }
     }
     let mut glob_matched_any = true;
-    if let Some(ref pat) = glob_pat {
+    if !glob_pats.is_empty() {
         let count_before = files.len();
-        let raw = glob_norm.as_deref().unwrap_or("");
         files.retain(|rel| {
-            pat.matches(rel)
-                || (!raw.contains('/')
-                    && Path::new(rel)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| pat.matches(n))
-                        .unwrap_or(false))
+            glob_pats.iter().any(|(pat, raw)| {
+                pat.matches(rel)
+                    || (!raw.contains('/')
+                        && Path::new(rel)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| pat.matches(n))
+                            .unwrap_or(false))
+            })
         });
         if files.is_empty() && count_before > 0 {
             glob_matched_any = false;
