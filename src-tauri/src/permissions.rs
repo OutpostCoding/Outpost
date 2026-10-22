@@ -77,14 +77,15 @@ impl PermissionStore {
     /// Open (or start) the policy at `path`. A missing/unreadable file starts fully
     /// gated (safe default). Legacy whitelist entries that are now intrinsically
     /// auto-approved read-only git commands (e.g. `git status`, `git diff`, `git log`)
-    /// are pruned on load so they don't linger as redundant custom pills in Settings.
+    /// or legacy shell builtins (`pwd`, `ls`, `dir`) are pruned on load so they don't
+    /// linger as redundant custom pills in Settings.
     pub fn open(path: PathBuf) -> Self {
         let mut data = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<PermData>(&s).ok())
             .unwrap_or_default();
         data.command_whitelist
-            .retain(|p| !is_readonly_git_tokens(p.split_whitespace()));
+            .retain(|p| !is_retired_whitelist_pattern(p));
         Self {
             path,
             data: Mutex::new(data),
@@ -381,6 +382,55 @@ fn extract_tight_pattern(cmd: &str) -> String {
         }
         _ => first.to_string(),
     }
+}
+
+/// True if a legacy whitelist pattern is an intrinsically safe, read-only inspection
+/// command (e.g. `git status`, `git diff`, `git log`, `pwd`, `ls`, `dir`) that has NO
+/// mutating operations and is now natively handled/auto-approved. These legacy entries
+/// are pruned on load so they don't linger as redundant custom pills in Settings.
+///
+/// NOTE: Subcommands like `git branch` (which mutates via `git branch new-feature`,
+/// `git branch -D`, `git branch -m`) or `git checkout` / `git switch` / `git stash`
+/// MUST NOT be pruned, because users explicitly whitelist them to auto-approve those
+/// mutating operations.
+fn is_retired_whitelist_pattern(pattern: &str) -> bool {
+    let trimmed = pattern.trim();
+    if matches!(trimmed, "pwd" | "ls" | "dir") {
+        return true;
+    }
+    let mut tokens = trimmed.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    if strip_program_extension(&first.to_ascii_lowercase()) != "git" {
+        return false;
+    }
+    let sub = loop {
+        let Some(tok) = tokens.next() else {
+            return false;
+        };
+        if matches!(tok, "--no-pager" | "-P" | "--no-optional-locks" | "--bare") {
+            continue;
+        }
+        if tok.starts_with('-') {
+            return false;
+        }
+        break tok.to_ascii_lowercase();
+    };
+    matches!(
+        sub.as_str(),
+        "status"
+            | "log"
+            | "diff"
+            | "show"
+            | "blame"
+            | "shortlog"
+            | "rev-parse"
+            | "ls-files"
+            | "ls-tree"
+            | "cat-file"
+            | "describe"
+    )
 }
 
 /// True if a sequence of tokens (from a whitespace-split shell segment or `argv`)
@@ -1192,5 +1242,51 @@ mod tests {
                 "expected mutating/unsafe git command to gate: {gated}"
             );
         }
+    }
+
+    #[test]
+    fn open_prunes_only_retired_read_only_commands_preserving_git_branch() {
+        let tmp = std::env::temp_dir().join(format!(
+            "test_perm_prune_{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let json = r#"{
+            "auto_project_writes": true,
+            "auto_commands": true,
+            "command_whitelist": [
+                "git status",
+                "git diff",
+                "git log",
+                "pwd",
+                "ls",
+                "dir",
+                "git branch",
+                "git add",
+                "git commit",
+                "git checkout",
+                "git switch",
+                "git stash",
+                "cargo check"
+            ]
+        }"#;
+        std::fs::write(&tmp, json).unwrap();
+        let store = PermissionStore::open(tmp.clone());
+        let wl = store.get().command_whitelist;
+        assert_eq!(
+            wl,
+            vec![
+                "git branch".to_string(),
+                "git add".to_string(),
+                "git commit".to_string(),
+                "git checkout".to_string(),
+                "git switch".to_string(),
+                "git stash".to_string(),
+                "cargo check".to_string(),
+            ]
+        );
+        let _ = std::fs::remove_file(tmp);
     }
 }
