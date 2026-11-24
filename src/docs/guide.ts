@@ -53,7 +53,7 @@ In the Code surface, the model operates under a **human-in-the-loop** security m
    * <kbd>Enter</kbd> &rarr; **Approve**: Immediately executes the change.
    * <kbd>Esc</kbd> &rarr; **Reject**: Cancels the action and returns feedback to the model.
 4. **Edit in Place**: Click any line in the diff or edit the command string directly inside the approval card to adjust the change before approving it.
-5. **Configurable Permissions**: Under **Settings → Coding → Security & Permissions**, you can whitelist specific safe commands (e.g. \`cargo check\`, \`npm test\`) to streamline repetitive workflows.
+5. **Execution Modes & Permissions**: Switch any coding session between **Supervised** (confirm every edit and command), **Standard** (auto-apply file edits & run whitelisted commands), and **Turbo** (walk-away autonomy for in-project edits and dev commands) directly from the composer bar — even mid-turn. Configure your default starting mode and Standard command whitelist (e.g. \`cargo check\`, \`npm test\`) under **Settings → Coding → Permissions & Safety**.
 
 ---
 

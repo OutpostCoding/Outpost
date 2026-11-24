@@ -154,21 +154,51 @@ pub fn connection_kind(base_url: Option<&str>) -> &'static str {
 }
 
 
-/// The coding-session orientation: WHERE the model works, exploration guidance, working memory lifecycle, and permissions posture.
-/// Session-static so it sits cleanly in the cached prefix.
-pub fn coding_orientation(root: &str, auto_writes: bool) -> String {
+/// The coding-session orientation: WHERE the model works, exploration guidance, working memory lifecycle,
+/// execution mode posture (`Supervised` · `Standard` · `Turbo`), and per-OS environment notes.
+/// Session-static (except when the user changes modes) so it sits cleanly in the cached prefix.
+pub fn coding_orientation(root: &str, mode: crate::permissions::ExecutionMode) -> String {
+    #[cfg(windows)]
+    let py_example = "py main.py";
+    #[cfg(not(windows))]
+    let py_example = "python3 main.py";
+
     let mut text = format!(
         "You are in a coding session rooted at: {root}.\n\
          Tool Selection Contract (always prefer specialized native tools over shell commands):\n\
          - Exploration & Search: Start with `code_search` as your primary discovery tool to locate relevant logic, concepts, and features across the codebase. Reach for `grep_search` only when you already know an exact identifier, symbol, or regex and need an exhaustive list of all call sites. Never run shell search commands (grep, findstr, find).\n\
          - Inspection: ALWAYS use `read_file` (pass `start` and `lines` when reading specific ranges of large files) or `find_symbols` (for structural outlines). Never use shell commands to view files (cat, type, head, tail).\n\
          - Modification: ALWAYS use `edit_file` (for targeted changes with snippet matching or symbol replacement) or `write_file` (to create or overwrite whole files). Never use shell commands or ad-hoc scripts to edit files.\n\
-         - Execution & Git: `run_command` is reserved for executing test suites, build tools, package managers, git commands, and launching services (e.g. `cargo check`, `npm test`, `python main.py`). Read-only git inspection (`git status`, `git log`, `git diff`, `git show`, `git blame`) is auto-approved without prompting. Before running `git commit`, inspect staged changes with `git diff --staged` or `git status` (or `get_diff`) to verify your modifications.\n\
+         - Execution & Git: `run_command` is reserved for executing test suites, build tools, package managers, git commands, and launching services (e.g. `cargo check`, `npm test`, `{py_example}`). Read-only git inspection (`git status`, `git log`, `git diff`, `git show`, `git blame`) is auto-approved without prompting. Before running `git commit`, inspect staged changes with `git diff --staged` or `git status` (or `get_diff`) to verify your modifications.\n\
          Working memory: tool results from earlier turns are archived into compact receipts (`receipt — read_file(...) returned...`) to conserve context. This is standard harness operation, not a tool failure. Re-read files or inspect symbols at any time as needed.\n\
          File safety: Outpost automatically snapshots files before editing or deleting. Use `get_diff` to inspect diffs and `restore_file` to undo changes when needed."
     );
-    if auto_writes {
-        text.push_str("\nPermissions: Auto-approval is active for `write_file` and `edit_file` — you can create, modify, and scaffold files directly without pausing for confirmation.");
+    match mode {
+        crate::permissions::ExecutionMode::Supervised => {
+            text.push_str(
+                "\nPermissions (Supervised mode): File modifications and non-read-only commands pause for user approval before running. Read-only git inspection runs automatically.",
+            );
+        }
+        crate::permissions::ExecutionMode::Standard => {
+            text.push_str(
+                "\nPermissions (Standard mode): `write_file` and `edit_file` apply automatically (backed by session snapshots). Read-only git inspection and whitelisted dev commands run automatically; other commands, file deletions, and renames pause for user confirmation.",
+            );
+        }
+        crate::permissions::ExecutionMode::Turbo => {
+            text.push_str(
+                "\nPermissions (Turbo mode — unattended): Project file writes, edits, renames, and single-file deletes/restores apply automatically (backed by session snapshots), and in-project dev/test commands (including inline interpreter probes via `argv` such as `[\"py\", \"-c\", \"...\"]`) execute without confirmation. Prefer `argv` over shell strings when passing inline code or complex arguments so shell quoting and metacharacters never interfere; shell pipes/redirection, subshells, `git push`, destructive git resets, and paths outside the project root are rejected immediately.",
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        text.push_str(
+            "\n\nEnvironment — Windows:\n\
+             - Prefer `run_command` with `argv` (e.g. `[\"py\", \"-m\", \"pytest\", \"-q\"]` or `[\"py\", \"-c\", \"...\"]`) for single commands and inline probes; when using shell-string `command`, foreground commands run in PowerShell (sequence with `;`, NOT `&&`) and use the `cwd` parameter instead of `cd`.\n\
+             - Python: use `py` (the Windows launcher), NOT `python` (e.g. `py --version`, `py -m pytest`, `py -m pip install X`).\n\
+             - Both stdout and stderr are captured automatically — never append `2>&1` or shell redirection.\n\
+             - Python runs in UTF-8 mode (`PYTHONUTF8=1`, `PYTHONDONTWRITEBYTECODE=1`) and git runs non-interactively (`GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`).",
+        );
     }
     text
 }

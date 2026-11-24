@@ -171,6 +171,7 @@ pub fn run() {
             commands::stop_repo_indexing,
             commands::get_permissions,
             commands::set_permissions,
+            commands::set_active_mode,
             commands::stop_turn,
             commands::stop_managed_process,
             commands::current_datetime,

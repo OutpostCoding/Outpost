@@ -18,6 +18,9 @@ import {
   withEditedText,
   loadPrefs,
   savePrefs,
+  CHAT_TOOLS_DEFAULT,
+  SESSION_TOOLS_DEFAULT,
+  type ThreadTools,
 } from "../utils";
 import type { Message, Segment } from "../lib/provider";
 
@@ -348,5 +351,33 @@ describe("loadPrefs / savePrefs", () => {
   it("returns empty prefs on corrupt stored JSON", () => {
     localStorage.setItem("outpost_prefs", "not json");
     expect(loadPrefs()).toEqual({});
+  });
+});
+
+describe("ExecutionMode defaults and Turbo fail-fast classification", () => {
+  it("leaves executionMode undefined in kind defaults so new/legacy sessions inherit default_mode", () => {
+    expect(CHAT_TOOLS_DEFAULT.executionMode).toBeUndefined();
+    expect(SESSION_TOOLS_DEFAULT.executionMode).toBeUndefined();
+
+    const savedTurbo: ThreadTools = {
+      ...SESSION_TOOLS_DEFAULT,
+      executionMode: "turbo",
+    };
+    expect(savedTurbo.executionMode).toBe("turbo");
+  });
+
+  it("classifies Turbo fail-fast rejection strings as tool errors", () => {
+    expect(
+      isToolError(
+        "error: Command 'rm' is restricted in Turbo mode. Use the native 'delete_file' tool to remove individual project files.",
+        "run_command",
+      ),
+    ).toBe(true);
+    expect(
+      isToolError(
+        "error: Restoring all session files at once ('restore_file' without a specific file path) is restricted in Turbo mode.",
+        "restore_file",
+      ),
+    ).toBe(true);
   });
 });

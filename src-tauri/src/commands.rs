@@ -1,6 +1,6 @@
 // ── surface: backend ──────────────────────────────────
 // The bridge — every Tauri command (send_chat, compaction, notes, settings…),
-// plus ENV_NOTES and the compaction prompt. Also owns AppState.
+// plus working-memory pruning and the compaction prompt. Also owns AppState.
 // Exports: AppState + ~50 commands (send_chat, compact_thread, preview_context, …) · Related: everything
 
 //! Tauri commands — the bridge between the React webview and the Rust-side agent
@@ -70,22 +70,6 @@ pub async fn list_models(
     };
     provider.list_models().await.map_err(|e| e.to_string())
 }
-
-/// Curated facts about the coding environment, injected into every session so
-/// local models stop rediscovering them the hard way (the `py` vs `python`,
-/// `where` vs `which`, cmd-quoting, cp1252-encoding loop). Compiled per-OS.
-/// Tool-semantics facts were dropped 2026-08-24 (run_command's two forms,
-/// multi-line Python, the never-launch-a-server rule) — each is stated in its
-/// tool's own definition, and a copy here would drift from it.
-#[cfg(windows)]
-const ENV_NOTES: &str = "\n\nEnvironment — Windows (commands run through PowerShell):\n\
-     - PowerShell is used for shell commands (tests, builds, git). Sequence commands with `;`, NOT `&&` (e.g. `cmd1; cmd2`). Use `$env:VAR` for environment variables and `curl.exe` (not `curl`) for HTTP requests.\n\
-     - Python: use `py` (the launcher), NOT `python`. Check with `py --version`; install with `py -m pip install X`.\n\
-     - Both stdout and stderr are captured automatically — no `2>&1` needed.\n\
-     - Python output is UTF-8 (PYTHONUTF8=1) and bytecode caching is disabled (PYTHONDONTWRITEBYTECODE=1); git runs non-interactively (GIT_PAGER=cat, GIT_TERMINAL_PROMPT=0).";
-
-#[cfg(not(windows))]
-const ENV_NOTES: &str = "";
 
 fn format_byte_size(bytes: usize) -> String {
     if bytes < 1024 {
@@ -885,6 +869,7 @@ pub async fn send_chat(
     // contract. Retire with the UI flag.
     vision_on: bool,
     read_prune_turns: Option<u32>,
+    execution_mode: Option<crate::permissions::ExecutionMode>,
     on_event: Channel<StreamEvent>,
 ) -> Result<(), String> {
     // Fresh cancellation token for this turn; `stop_turn` cancels it.
@@ -967,10 +952,10 @@ pub async fn send_chat(
         // NOT inside coding_orientation: the inspector shows the builder's output
         // as a standalone entry, so a baked-in leading blank line would render as
         // two phantom blank lines at the top of "Session · orientation".
-        let auto_writes = state.permissions.get().auto_project_writes;
+        let mode = execution_mode.unwrap_or_else(|| state.permissions.default_mode());
+        state.permissions.set_active_mode(mode);
         system_content.push_str("\n\n");
-        system_content.push_str(&coding_orientation(root, auto_writes));
-        system_content.push_str(ENV_NOTES);
+        system_content.push_str(&coding_orientation(root, mode));
     }
     request.messages.insert(
         0,
@@ -1519,20 +1504,27 @@ pub async fn get_permissions(
     Ok(state.permissions.get())
 }
 
-/// Replace the auto-approval permission policy from the Settings UI.
+/// Replace the execution-mode permission policy from the Settings UI.
 #[tauri::command]
 pub async fn set_permissions(
     state: State<'_, AppState>,
-    auto_project_writes: bool,
-    auto_commands: bool,
+    default_mode: crate::permissions::ExecutionMode,
     command_whitelist: Vec<String>,
 ) -> Result<(), String> {
     state.permissions.set(crate::permissions::PermData {
-        auto_project_writes,
-        auto_commands,
+        default_mode,
         command_whitelist,
     });
     Ok(())
+}
+
+/// Update the live execution mode of the active coding session (including mid-turn).
+#[tauri::command]
+pub fn set_active_mode(
+    state: State<'_, AppState>,
+    mode: crate::permissions::ExecutionMode,
+) {
+    state.permissions.set_active_mode(mode);
 }
 
 
@@ -2404,6 +2396,7 @@ pub fn preview_context(
     // assembled-context tail line can show the budget the live path uses.
     _max_context_tokens: Option<u32>,
     read_prune_turns: Option<u32>,
+    execution_mode: Option<crate::permissions::ExecutionMode>,
 ) -> ContextPreview {
     let mut sections = Vec::new();
 
@@ -2443,9 +2436,8 @@ pub fn preview_context(
     // shows the real, full context + its token cost without touching send_chat's
     // live model path.
     if let Some(root) = project_root.as_deref().filter(|r| !r.trim().is_empty()) {
-        let auto_writes = state.permissions.get().auto_project_writes;
-        let mut orientation = coding_orientation(root, auto_writes);
-        orientation.push_str(ENV_NOTES);
+        let mode = execution_mode.unwrap_or_else(|| state.permissions.active_mode());
+        let orientation = coding_orientation(root, mode);
         sections.push(ContextSection {
             label: "Session · orientation".into(),
             tokens: estimate_tokens(&orientation),
@@ -3824,17 +3816,26 @@ mod project_files_tests {
 
     #[test]
     fn test_coding_orientation_tool_directive() {
+        use crate::permissions::ExecutionMode;
+
         let grounding = crate::grounding::grounding_message("gemma-27b", "local", "openai", chrono_tz::UTC);
         assert!(!grounding.contains("Tool execution protocol:"));
 
-        let orientation_gated = crate::grounding::coding_orientation("/test/dir", false);
-        assert!(!orientation_gated.contains("Tool execution protocol:"));
-        assert!(!orientation_gated.contains("Permissions: Auto-approval is active"));
-        assert!(orientation_gated.contains("Working memory: tool results from earlier turns are archived into compact receipts (`receipt — read_file(...) returned...`) to conserve context."));
-        assert!(orientation_gated.contains("File safety: Outpost automatically snapshots files before editing or deleting."));
+        let orientation_sup = crate::grounding::coding_orientation("/test/dir", ExecutionMode::Supervised);
+        assert!(!orientation_sup.contains("Tool execution protocol:"));
+        assert!(orientation_sup.contains("Permissions (Supervised mode):"));
+        assert!(orientation_sup.contains("Working memory: tool results from earlier turns are archived into compact receipts (`receipt — read_file(...) returned...`) to conserve context."));
+        assert!(orientation_sup.contains("File safety: Outpost automatically snapshots files before editing or deleting."));
+        assert!(!orientation_sup.contains("curl.exe"));
+        assert!(!orientation_sup.contains("$env:VAR"));
+        assert!(!orientation_sup.contains("python main.py"));
 
-        let orientation_auto = crate::grounding::coding_orientation("/test/dir", true);
-        assert!(orientation_auto.contains("Permissions: Auto-approval is active for `write_file` and `edit_file` — you can create, modify, and scaffold files directly without pausing for confirmation."));
+        let orientation_std = crate::grounding::coding_orientation("/test/dir", ExecutionMode::Standard);
+        assert!(orientation_std.contains("Permissions (Standard mode): `write_file` and `edit_file` apply automatically"));
+
+        let orientation_turbo = crate::grounding::coding_orientation("/test/dir", ExecutionMode::Turbo);
+        assert!(orientation_turbo.contains("Permissions (Turbo mode — unattended):"));
+        assert!(orientation_turbo.contains("Prefer `argv` over shell strings"));
     }
 
     #[test]

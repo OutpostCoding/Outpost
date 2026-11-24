@@ -50,6 +50,8 @@ import {
   type ConnRoute,
   getPermissions,
   setPermissions,
+  setActiveMode,
+  type ExecutionMode,
   listActions,
   type ActionInfo,
   warmSearchIndex,
@@ -230,9 +232,11 @@ function App() {
   const [settingsSection, setSettingsSection] = useState<
     "general" | "connections" | "coding" | "profile" | "updates" | "guide"
   >("general");
-  // Selective auto-approval policy (backend-persisted). Default fully gated.
-  const [permAutoWrites, setPermAutoWrites] = useState(false);
-  const [permAutoCommands, setPermAutoCommands] = useState(false);
+  // 3-tier execution policy (Supervised · Standard · Turbo; backend-persisted default).
+  const [permDefaultMode, setPermDefaultMode] = useState<ExecutionMode>("supervised");
+  const permDefaultModeRef = useRef<ExecutionMode>("supervised");
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>("supervised");
+  const sessionHasExplicitModeRef = useRef<boolean>(false);
   const [permWhitelist, setPermWhitelist] = useState<string[]>([]);
   const [permDraft, setPermDraft] = useState("");
   const [view, setView] = useState<"chat" | "code">("chat");
@@ -615,6 +619,7 @@ function App() {
     profileAbout,
     maxContext,
     readPruneTurns,
+    executionMode,
     stagedFiles,
     stagedExternalFiles,
   });
@@ -1006,6 +1011,10 @@ function App() {
     setTemperature(t.temperature);
     setTopP(t.topP);
     setMaxTokens(t.maxTokens);
+    sessionHasExplicitModeRef.current = Boolean(t.executionMode);
+    const resolvedMode: ExecutionMode = t.executionMode ?? permDefaultModeRef.current;
+    setExecutionMode(resolvedMode);
+    void setActiveMode(resolvedMode);
   }
 
   // Load the per-chat config (documents + system prompt + tool switches) when
@@ -1132,10 +1141,11 @@ function App() {
           temperature,
           topP,
           maxTokens,
+          ...(sessionRoot ? { executionMode } : {}),
         },
       }),
     ).catch(() => {});
-  }, [added, madeInChat, systemPrompt, systemScope, sessionRoot, compaction, currentThreadId, toolsOn, webSearchOn, webFetchOn, webOn, visionOn, godotToolsOn, browserOn, liteTools, codeGroupsOn, mdWriteOn, notesOn, htmlWriteOn, codeOn, samplingOn, temperature, topP, maxTokens]);
+  }, [added, madeInChat, systemPrompt, systemScope, sessionRoot, compaction, currentThreadId, toolsOn, webSearchOn, webFetchOn, webOn, visionOn, godotToolsOn, browserOn, liteTools, codeGroupsOn, mdWriteOn, notesOn, htmlWriteOn, codeOn, samplingOn, temperature, topP, maxTokens, executionMode]);
 
   // Persist global UI preferences (theme, model + tools) across launches. Sampling is
   // per-thread now (ThreadTools), so it is deliberately NOT persisted here.
@@ -1229,14 +1239,14 @@ function App() {
         for (const pattern of patterns) {
           if (!list.includes(pattern)) list.push(pattern);
         }
-        if (list.length !== p.command_whitelist.length || !p.auto_commands) {
-          await setPermissions(p.auto_project_writes, true, list);
+        if (list.length !== p.command_whitelist.length) {
+          await setPermissions(p.default_mode, list);
           setPermWhitelist(list);
-          setPermAutoWrites(p.auto_project_writes);
-          setPermAutoCommands(true);
+          permDefaultModeRef.current = p.default_mode;
+          setPermDefaultMode(p.default_mode);
         }
         const names = patterns.map((x) => `“${x}”`).join(", ");
-        setNotice(`Always allow ${names} — manage in Settings → Permissions & Safety.`);
+        setNotice(`Always allow ${names} — manage in Settings → Coding → Permissions & Safety.`);
       } catch (e) {
         setError(`Couldn't save the auto-approval rule: ${e}`);
       }
@@ -1325,23 +1335,38 @@ function App() {
   useEffect(() => {
     getPermissions()
       .then((p) => {
-        setPermAutoWrites(p.auto_project_writes);
-        setPermAutoCommands(p.auto_commands);
+        permDefaultModeRef.current = p.default_mode;
+        setPermDefaultMode(p.default_mode);
         setPermWhitelist(p.command_whitelist);
+        if (!sessionHasExplicitModeRef.current) {
+          setExecutionMode(p.default_mode);
+          void setActiveMode(p.default_mode);
+        }
       })
       .catch(() => {});
   }, []);
 
-  // Persist a policy change (any toggle or whitelist edit) as it's made.
-  async function updatePerms(autoWrites: boolean, autoCmds: boolean, list: string[]) {
-    setPermAutoWrites(autoWrites);
-    setPermAutoCommands(autoCmds);
+  // Persist a global policy change (default mode or Standard whitelist edit) as it's made.
+  async function updatePerms(defaultMode: ExecutionMode, list: string[]) {
+    permDefaultModeRef.current = defaultMode;
+    setPermDefaultMode(defaultMode);
     setPermWhitelist(list);
+    if (!sessionHasExplicitModeRef.current) {
+      setExecutionMode(defaultMode);
+      void setActiveMode(defaultMode);
+    }
     try {
-      await setPermissions(autoWrites, autoCmds, list);
+      await setPermissions(defaultMode, list);
     } catch (e) {
       setError(`Couldn't save settings: ${e}`);
     }
+  }
+
+  // Switch the active coding session's execution mode (live, including mid-turn).
+  function changeSessionMode(next: ExecutionMode) {
+    sessionHasExplicitModeRef.current = true;
+    setExecutionMode(next);
+    void setActiveMode(next);
   }
 
 
@@ -1351,7 +1376,7 @@ function App() {
     const p = permDraft.trim();
     setPermDraft("");
     if (!p || permWhitelist.includes(p)) return;
-    updatePerms(permAutoWrites, permAutoCommands, [...permWhitelist, p]);
+    updatePerms(permDefaultMode, [...permWhitelist, p]);
   }
 
   // Re-fetch the active source's model list — handy when LM Studio was started
@@ -1630,6 +1655,7 @@ function App() {
               temperature,
               topP,
               maxTokens,
+              ...(sessionRoot ? { executionMode } : {}),
             },
           }),
         ).catch(() => {});
@@ -1773,6 +1799,7 @@ function App() {
           },
         }),
         readPruneTurns,
+        sessionRoot ? executionMode : null,
       );
       // Did this turn leave the model's own mark on the transcript?
       // `acc`/`racc` mirror every text and reasoning segment, so they carry the
@@ -2263,8 +2290,7 @@ function App() {
     setMaxToolCalls,
     readPruneTurns,
     setReadPruneTurns,
-    permAutoWrites,
-    permAutoCommands,
+    permDefaultMode,
     permWhitelist,
     permDraft,
     setPermDraft,
@@ -2430,6 +2456,8 @@ function App() {
         setMaxTokens={setMaxTokens}
         showToggles={showToggles}
         setShowToggles={setShowToggles}
+        executionMode={executionMode}
+        onChangeExecutionMode={changeSessionMode}
       />
       <TerminalPane layoutDir="row" />
       </div>

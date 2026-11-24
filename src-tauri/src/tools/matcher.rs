@@ -663,7 +663,13 @@ pub fn resolve_symbol_edit(
     let old_str_opt = old.filter(|s| !s.is_empty());
     if let Some(old_str) = old_str_opt {
         // Superpower C: Symbol-Scoped Snippet Edit
-        let scope_start = loc.outer_start_byte;
+        let line_start = current[..loc.outer_start_byte].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let leading_ws = &current[line_start..loc.outer_start_byte];
+        let scope_start = if leading_ws.chars().all(|c| c.is_whitespace()) {
+            line_start
+        } else {
+            loc.outer_start_byte
+        };
         let scope_end = loc.outer_end_byte;
         let scoped_content = &current[scope_start..scope_end];
 
@@ -1205,6 +1211,26 @@ mod symbol_edit_tests {
         assert!(!updated.contains("@dataclass"));
         assert!(!updated.contains("Snake:"));
         assert!(updated.contains("class SnakeGame:\n    pass\n"));
+    }
+
+    #[test]
+    fn superpower_c_python_method_edit_with_def_line_preserves_indentation() {
+        let file = "class Game:\n    def run(self) -> None:\n        running = True\n        while running:\n            self.handle_events()\n";
+        let old = "    def run(self) -> None:\n        running = True\n        while running:\n            self.handle_events()";
+        let new = "    def run(self) -> None:\n        running = True\n        while running:\n            if not self.handle_events():\n                break";
+        let (updated, _note) = resolve_symbol_edit(file, "py", "run", Some(old), new).unwrap();
+        assert!(updated.contains("        running = True"), "body must retain 8 spaces indentation, got:\n{}", updated);
+    }
+
+    #[test]
+    fn superpower_c_python_method_edit_unindented_snippet_harmonizes_indentation() {
+        let file = "class Game:\n    def run(self) -> None:\n        running = True\n        while running:\n            self.handle_events()\n";
+        let old = "def run(self) -> None:\n    running = True\n    while running:\n        self.handle_events()";
+        let new = "def run(self) -> None:\n    running = True\n    while running:\n        if not self.handle_events():\n            break";
+        let (updated, _note) = resolve_symbol_edit(file, "py", "run", Some(old), new).unwrap();
+        assert!(updated.contains("    def run(self) -> None:"), "header must have 4 spaces, got:\n{}", updated);
+        assert!(updated.contains("        running = True"), "body must have 8 spaces, got:\n{}", updated);
+        assert!(updated.contains("            if not self.handle_events():"), "inner block must have 12 spaces, got:\n{}", updated);
     }
 
     #[test]

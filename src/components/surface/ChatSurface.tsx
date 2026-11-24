@@ -12,7 +12,7 @@ import {
 } from "../../utils";
 import type {
   ContextPreview,
-
+  ExecutionMode,
   Message,
   Segment,
 } from "../../lib/provider";
@@ -136,6 +136,8 @@ export function ChatSurface({
   setMaxTokens,
   showToggles,
   setShowToggles,
+  executionMode = "supervised",
+  onChangeExecutionMode,
 }: {
   preview: ContextPreview | null;
   systemPrompt: string;
@@ -250,7 +252,34 @@ export function ChatSurface({
   setMaxTokens: (v: string) => void;
   showToggles: boolean;
   setShowToggles: React.Dispatch<React.SetStateAction<boolean>>;
+  executionMode?: ExecutionMode;
+  onChangeExecutionMode?: (mode: ExecutionMode) => void;
 }) {
+  const [showModeMenu, setShowModeMenu] = React.useState(false);
+
+  const modeOptions: {
+    id: ExecutionMode;
+    label: string;
+    desc: string;
+  }[] = [
+    {
+      id: "supervised",
+      label: "Supervised",
+      desc: "Ask before applying file edits, deletions, or running commands.",
+    },
+    {
+      id: "standard",
+      label: "Standard",
+      desc: "Auto-apply file edits & run whitelisted commands; ask for the rest.",
+    },
+    {
+      id: "turbo",
+      label: "Turbo",
+      desc: "Auto-apply edits & run in-project dev commands unattended.",
+    },
+  ];
+  const currentModeInfo =
+    modeOptions.find((m) => m.id === executionMode) ?? modeOptions[0];
   const [copiedError, setCopiedError] = React.useState(false);
 
   return (
@@ -717,11 +746,88 @@ export function ChatSurface({
             <button
               type="button"
               className="plus-btn"
-              onClick={() => setShowToggles((v) => !v)}
+              onClick={() => {
+                setShowModeMenu(false);
+                setShowToggles((v) => !v);
+              }}
               title="Tools & options"
             >
               +
             </button>
+            {sessionRoot && (
+              <div className="mode-selector-wrap">
+                <button
+                  type="button"
+                  className={`mode-pill mode-${executionMode}`}
+                  onClick={() => {
+                    setShowToggles(false);
+                    setShowModeMenu((v) => !v);
+                  }}
+                  title={`Execution mode: ${currentModeInfo.label} — ${currentModeInfo.desc}`}
+                >
+                  {executionMode === "turbo" && (
+                    <span className="mode-pill-bolt" aria-hidden="true">
+                      ⚡
+                    </span>
+                  )}
+                  <span className="mode-pill-label">{currentModeInfo.label}</span>
+                  <span className="mode-pill-chevron" aria-hidden="true">
+                    ▾
+                  </span>
+                </button>
+                {showModeMenu && (
+                  <>
+                    <div
+                      className="popup-backdrop"
+                      onClick={() => setShowModeMenu(false)}
+                    />
+                    <div
+                      className="mode-popup"
+                      role="menu"
+                      aria-label="Execution mode"
+                      onMouseDown={(e) => e.stopPropagation()}
+                    >
+                      <div className="mode-popup-header">Execution mode</div>
+                      {modeOptions.map((opt) => {
+                        const active = executionMode === opt.id;
+                        return (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            role="menuitemradio"
+                            aria-checked={active}
+                            className={`mode-option ${active ? "active" : ""} ${
+                              opt.id === "turbo" ? "turbo" : ""
+                            }`}
+                            onClick={() => {
+                              onChangeExecutionMode?.(opt.id);
+                              setShowModeMenu(false);
+                            }}
+                          >
+                            <div className="mode-option-top">
+                              <span className="mode-option-title">
+                                {opt.id === "turbo" && (
+                                  <span className="mode-option-bolt" aria-hidden="true">
+                                    ⚡
+                                  </span>
+                                )}
+                                {opt.label}
+                              </span>
+                              {active && (
+                                <span className="mode-option-check" aria-hidden="true">
+                                  ✓
+                                </span>
+                              )}
+                            </div>
+                            <span className="mode-option-desc">{opt.desc}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
             {showToggles && (
               <>
                 <div

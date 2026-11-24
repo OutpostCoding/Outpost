@@ -300,60 +300,67 @@ impl Tools {
             .unwrap_or(2000)
             .clamp(100, 30_000);
 
-        // Subtractive gate: approve THIS exact command in THIS folder before it runs.
-        // A whitelisted command that clears the safety guards runs without a prompt;
-        // everything else asks (default-deny on this uncontained surface). The argv
-        // form is judged WITHOUT the shell guards: nothing is re-parsed by a shell —
-        // the program and its arguments are spawned directly — so metacharacters in an
-        // argument are inert data, not a smuggling vector.
-        let auto_approved = match argv.as_deref() {
-            Some(a) => self.permissions.argv_auto_approved(&command, a),
-            None => self.permissions.command_auto_approved(&command),
-        };
-        if !auto_approved {
-            let id = self.approvals.next_id();
-            let rx = self.approvals.register(id);
-            let preview = if background {
-                format!(
-                    "$ {command}\n\nStarts a background process in: {}",
-                    work_dir.display()
-                )
-            } else {
-                format!("$ {command}\n\nWorking directory: {}", work_dir.display())
-            };
-            let warning = if background {
-                Some("This starts a real process that keeps running in the background until stopped — review it before approving.".into())
-            } else {
-                Some("This runs a real shell command on your machine — review it before approving.".into())
-            };
-            // The patterns an "Always allow" click would persist (the leading token of
-            // every segment, or the program token for argv). Empty when the command can
-            // never auto-approve — it fails a guard — so the UI disables the button
-            // rather than offering one that silently no-ops. (Guards are re-checked at
-            // auto-approve time; this is a hint, not a bypass.)
-            let remember = self.permissions.remember_tokens(&command, argv.as_deref());
-            if on_event
-                .send(StreamEvent::ToolApproval {
-                    id,
-                    tool: "run_command".into(),
-                    path: work_dir.display().to_string(),
-                    diff: preview,
-                    warning,
-                    command: Some(CommandApproval {
-                        text: command.clone(),
-                        remember,
-                    }),
-                })
-                .is_err()
-            {
-                return "could not request approval to run the command (UI channel closed)".into();
-            }
-            let decision = rx.await.unwrap_or_default();
-            if decision != "approve" {
-                return rejection_response(
-                    &decision,
-                    &format!("The user declined to run: {command}"),
-                );
+        // Evaluate THIS exact command in THIS folder against the active ExecutionMode
+        // (`Supervised` · `Standard` · `Turbo`):
+        //   • `AutoApprove` → proceed directly
+        //   • `RejectTurbo` → fail-fast return instructive hint (never hangs on an approval card)
+        //   • `AskUser`     → pause and display an interactive Approval Card
+        match self
+            .permissions
+            .evaluate_command(&command, argv.as_deref(), root)
+        {
+            crate::permissions::CommandDecision::AutoApprove => {}
+            crate::permissions::CommandDecision::RejectTurbo(reason) => return reason,
+            crate::permissions::CommandDecision::AskUser => {
+                let id = self.approvals.next_id();
+                let rx = self.approvals.register(id);
+                let preview = if background {
+                    format!(
+                        "$ {command}\n\nStarts a background process in: {}",
+                        work_dir.display()
+                    )
+                } else {
+                    format!("$ {command}\n\nWorking directory: {}", work_dir.display())
+                };
+                let warning = if background {
+                    Some("This starts a real process that keeps running in the background until stopped — review it before approving.".into())
+                } else {
+                    Some("This runs a real shell command on your machine — review it before approving.".into())
+                };
+                // In `Supervised` mode every non-read-only command intentionally asks, so omit
+                // "Always allow" (`remember` empty). In `Standard` mode offer tight whitelist
+                // patterns whenever the command passes Standard guards.
+                let remember = if self.permissions.active_mode()
+                    == crate::permissions::ExecutionMode::Supervised
+                {
+                    Vec::new()
+                } else {
+                    self.permissions.remember_tokens(&command, argv.as_deref())
+                };
+                if on_event
+                    .send(StreamEvent::ToolApproval {
+                        id,
+                        tool: "run_command".into(),
+                        path: work_dir.display().to_string(),
+                        diff: preview,
+                        warning,
+                        command: Some(CommandApproval {
+                            text: command.clone(),
+                            remember,
+                        }),
+                    })
+                    .is_err()
+                {
+                    return "could not request approval to run the command (UI channel closed)"
+                        .into();
+                }
+                let decision = rx.await.unwrap_or_default();
+                if decision != "approve" {
+                    return rejection_response(
+                        &decision,
+                        &format!("The user declined to run: {command}"),
+                    );
+                }
             }
         }
 
@@ -609,4 +616,3 @@ mod tests {
         );
     }
 }
-

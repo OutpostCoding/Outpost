@@ -12,6 +12,7 @@ import {
   deleteEmbeddingModel,
   revealModelsDir,
   type EmbeddingModelStatus,
+  type ExecutionMode,
 } from "../lib/provider";
 import { getVersion } from "@tauri-apps/api/app";
 import { useAppContext } from "../AppContext";
@@ -113,8 +114,7 @@ export function SettingsModal({
     setMaxToolCalls,
     readPruneTurns,
     setReadPruneTurns,
-    permAutoWrites,
-    permAutoCommands,
+    permDefaultMode,
     permWhitelist,
     permDraft,
     setPermDraft,
@@ -257,7 +257,7 @@ export function SettingsModal({
       } catch {}
     }
     if (!permWhitelist.includes(p)) {
-      updatePerms(permAutoWrites, permAutoCommands, [...permWhitelist, p]);
+      updatePerms(permDefaultMode, [...permWhitelist, p]);
     }
     setPermDraft("");
   }
@@ -267,12 +267,11 @@ export function SettingsModal({
   function handleToggleCustom(pattern: string) {
     if (permWhitelist.includes(pattern)) {
       updatePerms(
-        permAutoWrites,
-        permAutoCommands,
+        permDefaultMode,
         permWhitelist.filter((x) => x !== pattern),
       );
     } else {
-      updatePerms(permAutoWrites, permAutoCommands, [...permWhitelist, pattern]);
+      updatePerms(permDefaultMode, [...permWhitelist, pattern]);
     }
   }
 
@@ -292,7 +291,7 @@ export function SettingsModal({
       } catch {}
       const remainingWhitelist = permWhitelist.filter((x) => !deleteSet.has(x));
       if (remainingWhitelist.length !== permWhitelist.length) {
-        updatePerms(permAutoWrites, permAutoCommands, remainingWhitelist);
+        updatePerms(permDefaultMode, remainingWhitelist);
       }
     }
     setToDelete([]);
@@ -733,47 +732,84 @@ export function SettingsModal({
                 <div className="settings-section">
                   <div className="settings-section-header">Permissions & Safety</div>
                   <div className="settings-group">
-                    <div className="settings-row">
+                    <div className="settings-row vertical">
                       <div className="settings-row-info">
-                        <span className="settings-row-label">Auto-approve project file writes & edits</span>
+                        <span className="settings-row-label">Default coding mode</span>
                         <span className="settings-row-hint">
-                          Sandboxed to the project folder and recoverable via git.
-                          Deletes and renames always ask regardless.
+                          Sets the starting execution mode for new coding sessions. Each session remembers its own mode, and you can switch modes anytime from the composer bar (even mid-turn).
                         </span>
                       </div>
-                      <div className="settings-row-control">
-                        <Switch
-                          checked={permAutoWrites}
-                          onChange={(v) => updatePerms(v, permAutoCommands, permWhitelist)}
-                        />
+                      <div className="settings-mode-grid" role="radiogroup" aria-label="Default coding mode">
+                        {(
+                          [
+                            {
+                              id: "supervised" as ExecutionMode,
+                              label: "Supervised",
+                              desc: "Ask before applying file edits, deletions, or running commands.",
+                            },
+                            {
+                              id: "standard" as ExecutionMode,
+                              label: "Standard",
+                              desc: "Auto-apply file edits & run whitelisted commands; ask for the rest.",
+                            },
+                            {
+                              id: "turbo" as ExecutionMode,
+                              label: "Turbo",
+                              desc: "Auto-apply edits & run in-project dev commands unattended.",
+                            },
+                          ]
+                        ).map((opt) => {
+                          const active = permDefaultMode === opt.id;
+                          return (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              role="radio"
+                              aria-checked={active}
+                              className={`settings-mode-card ${active ? "active" : ""} ${
+                                opt.id === "turbo" ? "turbo" : ""
+                              }`}
+                              onClick={() => updatePerms(opt.id, permWhitelist)}
+                            >
+                              <div className="settings-mode-card-top">
+                                <span className="settings-mode-card-title">
+                                  {opt.id === "turbo" && (
+                                    <span className="perm-chip-badge" aria-hidden="true">
+                                      ⚡
+                                    </span>
+                                  )}
+                                  {opt.label}
+                                </span>
+                                {active && (
+                                  <span className="settings-mode-card-check" aria-hidden="true">
+                                    ✓
+                                  </span>
+                                )}
+                              </div>
+                              <span className="settings-mode-card-desc">{opt.desc}</span>
+                            </button>
+                          );
+                        })}
                       </div>
                     </div>
                     <div className="settings-row">
                       <div className="settings-row-info">
                         <div className="perm-header-row">
-                          <span className="settings-row-label">Auto-approve command patterns</span>
+                          <span className="settings-row-label">Standard mode command whitelist</span>
                           {permWhitelist.length > 0 && (
-                            <span className={`perm-count-badge ${!permAutoCommands ? "paused" : ""}`}>
-                              {permAutoCommands
-                                ? `${permWhitelist.length} active`
-                                : `${permWhitelist.length} saved · Paused`}
+                            <span className="perm-count-badge">
+                              {`${permWhitelist.length} active`}
                             </span>
                           )}
                         </div>
                         <span className="settings-row-hint">
-                          Read-only Git inspection (<code>status</code>, <code>diff</code>, <code>log</code>, <code>show</code>, <code>blame</code>) is always allowed automatically. Other commands matching a whitelisted pattern run without confirmation if they clear sandbox guards (no path escapes, no pipes or shell redirection, no blacklisted system tools). Compound commands require all segments to match.
+                          Used in <strong>Standard</strong> mode: commands matching an active pattern below run without confirmation when they clear sandbox guards (read-only Git inspection like <code>status</code>, <code>diff</code>, <code>log</code>, <code>show</code>, and <code>blame</code> is always allowed automatically). In <strong>Supervised</strong> mode all non-read-only commands ask; in <strong>Turbo</strong> mode non-restricted in-project dev commands run automatically.
                         </span>
-                      </div>
-                      <div className="settings-row-control">
-                        <Switch
-                          checked={permAutoCommands}
-                          onChange={(v) => updatePerms(permAutoWrites, v, permWhitelist)}
-                        />
                       </div>
                     </div>
                     <div className="settings-row vertical" style={{ borderTop: "none", paddingTop: 0 }}>
                       {/* Unified Category Trays */}
-                      <div className={`perm-palette-trays ${!permAutoCommands ? "paused" : ""}`}>
+                      <div className="perm-palette-trays">
                         {COMMAND_PALETTES.map((cat) => (
                           <div className="perm-tray" key={cat.id}>
                             <div className="perm-tray-header">{cat.name}</div>
@@ -789,12 +825,11 @@ export function SettingsModal({
                                     onClick={() => {
                                       if (isActive) {
                                         updatePerms(
-                                          permAutoWrites,
-                                          permAutoCommands,
+                                          permDefaultMode,
                                           permWhitelist.filter((x) => x !== pattern),
                                         );
                                       } else {
-                                        updatePerms(permAutoWrites, permAutoCommands, [...permWhitelist, pattern]);
+                                        updatePerms(permDefaultMode, [...permWhitelist, pattern]);
                                       }
                                     }}
                                   >

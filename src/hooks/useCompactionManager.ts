@@ -11,6 +11,7 @@ import {
   type Compaction,
   type ContextPreview,
   type ConnRoute,
+  type ExecutionMode,
 } from "../lib/provider";
 
 export interface CompactionManagerOptions {
@@ -60,6 +61,7 @@ export interface CompactionManagerOptions {
   profileAbout: string; // profile about text
   maxContext: string; // user-declared max-context label
   readPruneTurns?: number | null; // read history retention limit
+  executionMode?: ExecutionMode; // coding session execution mode (Supervised · Standard · Turbo)
   stagedFiles: string[]; // files staged for the NEXT turn — preview only; the framing itself is passed per-turn
   stagedExternalFiles?: { name: string; content: string }[];
   threadIdRef?: React.MutableRefObject<number | null>;
@@ -105,6 +107,7 @@ export function useCompactionManager(opts: CompactionManagerOptions) {
     profileAbout,
     maxContext,
     readPruneTurns,
+    executionMode,
     stagedFiles,
     stagedExternalFiles,
   } = opts;
@@ -372,6 +375,7 @@ export function useCompactionManager(opts: CompactionManagerOptions) {
       connRoute().baseUrl,
       contextCap(),
       readPruneTurns,
+      executionMode ?? null,
     )
       .then((p) => {
         if (!cancelled) setPreview(p);
@@ -413,6 +417,7 @@ export function useCompactionManager(opts: CompactionManagerOptions) {
     profileAbout,
     maxContext,
     readPruneTurns,
+    executionMode,
     // Staged-attachment framing is part of the send, so the inspector has to
     // re-run when the staged set changes or the preview under-reports it.
     stagedFiles,

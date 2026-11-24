@@ -882,6 +882,79 @@ body,
   margin-bottom: 2px;
 }
 
+.settings-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.settings-mode-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 10px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--field, rgba(255, 255, 255, 0.02));
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.settings-mode-card:hover {
+  border-color: var(--focus);
+  background: var(--elevated);
+}
+
+.settings-mode-card.active {
+  border-color: var(--primary);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.settings-mode-card.turbo.active {
+  border-color: rgba(245, 158, 11, 0.55);
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.settings-mode-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+
+.settings-mode-card-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-bright, var(--text));
+}
+
+.settings-mode-card.turbo.active .settings-mode-card-title {
+  color: #fcd34d;
+}
+
+.settings-mode-card-check {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--primary);
+}
+
+.settings-mode-card.turbo.active .settings-mode-card-check {
+  color: #f59e0b;
+}
+
+.settings-mode-card-desc {
+  font-size: 11px;
+  line-height: 1.38;
+  color: var(--muted);
+}
+
 .perm-count-badge {
   font-size: 10px;
   font-weight: 700;
@@ -2217,6 +2290,163 @@ body,
 .toggles {
   position: relative;
   display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mode-selector-wrap {
+  position: relative;
+  display: inline-flex;
+}
+
+.mode-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  border-radius: 9999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  user-select: none;
+}
+
+.mode-pill:hover {
+  background: var(--surface);
+  border-color: var(--focus);
+  color: var(--text);
+}
+
+.mode-pill.mode-standard {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.mode-pill.mode-turbo {
+  border-color: rgba(245, 158, 11, 0.5);
+  background: rgba(245, 158, 11, 0.11);
+  color: #fcd34d;
+}
+
+.mode-pill.mode-turbo:hover {
+  border-color: rgba(245, 158, 11, 0.75);
+  background: rgba(245, 158, 11, 0.18);
+  color: #fef08a;
+}
+
+.mode-pill-bolt {
+  font-size: 11px;
+  line-height: 1;
+  color: #f59e0b;
+}
+
+.mode-pill-chevron {
+  font-size: 10px;
+  opacity: 0.7;
+  line-height: 1;
+}
+
+.mode-popup {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 50;
+  width: 286px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.42);
+  font-family: var(--font-sans);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.mode-popup-header {
+  padding: 5px 8px 3px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.mode-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.14s ease, border-color 0.14s ease;
+}
+
+.mode-option:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.mode-option.active {
+  background: rgba(255, 255, 255, 0.07);
+  border-color: var(--border);
+}
+
+.mode-option.turbo.active {
+  border-color: rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.1);
+}
+
+.mode-option-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+}
+
+.mode-option-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-bright, var(--text));
+}
+
+.mode-option.turbo .mode-option-title {
+  color: #fcd34d;
+}
+
+.mode-option-bolt {
+  font-size: 11px;
+  color: #f59e0b;
+}
+
+.mode-option-check {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--primary);
+}
+
+.mode-option.turbo.active .mode-option-check {
+  color: #f59e0b;
+}
+
+.mode-option-desc {
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--muted);
 }
 
 .popup-backdrop {
@@ -6669,6 +6899,75 @@ body,
   background: #fff5f5;
   border-color: #d1242f;
   color: #82071e;
+}
+
+[data-theme="light"] .mode-pill.mode-standard {
+  background: rgba(0, 0, 0, 0.03);
+}
+
+[data-theme="light"] .mode-pill.mode-turbo {
+  border-color: #b45309;
+  background: #fef3c7;
+  color: #92400e;
+}
+
+[data-theme="light"] .mode-pill.mode-turbo:hover {
+  border-color: #92400e;
+  background: #fde68a;
+  color: #78350f;
+}
+
+[data-theme="light"] .mode-popup {
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.12);
+}
+
+[data-theme="light"] .mode-option:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+[data-theme="light"] .mode-option.active {
+  background: #ebf0ec;
+  border-color: #b5c4b8;
+}
+
+[data-theme="light"] .mode-option.turbo .mode-option-title {
+  color: #92400e;
+}
+
+[data-theme="light"] .mode-option.turbo.active {
+  border-color: #b45309;
+  background: #fef3c7;
+}
+
+[data-theme="light"] .mode-option.turbo.active .mode-option-check {
+  color: #b45309;
+}
+
+[data-theme="light"] .settings-mode-card {
+  background: #ffffff;
+}
+
+[data-theme="light"] .settings-mode-card:hover {
+  background: #ebf0ec;
+  border-color: #b5c4b8;
+}
+
+[data-theme="light"] .settings-mode-card.active {
+  background: #e4f3e6;
+  border-color: #166534;
+}
+
+[data-theme="light"] .settings-mode-card.turbo.active {
+  border-color: #b45309;
+  background: #fef3c7;
+}
+
+[data-theme="light"] .settings-mode-card.turbo.active .settings-mode-card-title {
+  color: #92400e;
+}
+
+[data-theme="light"] .settings-mode-card.turbo.active .settings-mode-card-check {
+  color: #b45309;
 }
 
 /* Unselected command pill: clean, calm resting white card on mineral tray */

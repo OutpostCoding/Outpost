@@ -1,5 +1,5 @@
 import React, { createContext, useContext } from "react";
-import type { ThreadInfo, NoteInfo, Compaction, ActionInfo } from "./lib/provider";
+import type { ThreadInfo, NoteInfo, Compaction, ActionInfo, ExecutionMode } from "./lib/provider";
 import type { Update } from "@tauri-apps/plugin-updater";
 
 export interface ExternalFileAttachment {
@@ -22,12 +22,11 @@ export interface AppContextType {
   setMaxToolCalls: (v: string) => void;
   readPruneTurns: number | null;
   setReadPruneTurns: (v: number | null) => void;
-  permAutoWrites: boolean;
-  permAutoCommands: boolean;
+  permDefaultMode: ExecutionMode;
   permWhitelist: string[];
   permDraft: string;
   setPermDraft: (v: string) => void;
-  updatePerms: (autoWrites: boolean, autoCmds: boolean, list: string[]) => void;
+  updatePerms: (defaultMode: ExecutionMode, list: string[]) => void;
   addPermPattern: () => void;
 
   profileName: string;

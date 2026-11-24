@@ -176,6 +176,7 @@ export async function sendChat(
   visionOn: boolean,
   onEvent: (event: StreamEvent) => void,
   readPruneTurns?: number | null,
+  executionMode?: ExecutionMode | null,
 ): Promise<void> {
   const channel = new Channel<StreamEvent>();
   channel.onmessage = onEvent;
@@ -192,6 +193,7 @@ export async function sendChat(
     projectRoot,
     visionOn,
     readPruneTurns: readPruneTurns ?? null,
+    executionMode: executionMode ?? null,
     onEvent: channel,
   });
 }
@@ -275,10 +277,12 @@ export function listThreads(): Promise<ThreadInfo[]> {
   return invoke<ThreadInfo[]>("list_threads");
 }
 
-/** The auto-approval + behaviour policy (mirrors the Rust `PermData`). */
+/** 3-tier execution posture for coding sessions (`Supervised` · `Standard` · `Turbo`). */
+export type ExecutionMode = "supervised" | "standard" | "turbo";
+
+/** The execution-mode + whitelist policy (mirrors the Rust `PermData`). */
 export interface Permissions {
-  auto_project_writes: boolean;
-  auto_commands: boolean;
+  default_mode: ExecutionMode;
   command_whitelist: string[];
 }
 
@@ -287,17 +291,20 @@ export function getPermissions(): Promise<Permissions> {
   return invoke<Permissions>("get_permissions");
 }
 
-/** Replace the policy. */
+/** Replace the persisted default mode + Standard command whitelist. */
 export function setPermissions(
-  autoProjectWrites: boolean,
-  autoCommands: boolean,
+  defaultMode: ExecutionMode,
   commandWhitelist: string[],
 ): Promise<void> {
   return invoke("set_permissions", {
-    autoProjectWrites,
-    autoCommands,
+    defaultMode,
     commandWhitelist,
   });
+}
+
+/** Update the live coding session execution mode immediately (including mid-turn). */
+export function setActiveMode(mode: ExecutionMode): Promise<void> {
+  return invoke("set_active_mode", { mode });
 }
 
 
@@ -478,6 +485,7 @@ export function previewContext(
   connBaseUrl: string | null,
   maxContextTokens: number | null,
   readPruneTurns?: number | null,
+  executionMode?: ExecutionMode | null,
 ): Promise<ContextPreview> {
   return invoke<ContextPreview>("preview_context", {
     messages,
@@ -492,6 +500,7 @@ export function previewContext(
     connBaseUrl,
     maxContextTokens,
     readPruneTurns: readPruneTurns ?? null,
+    executionMode: executionMode ?? null,
   });
 }
 

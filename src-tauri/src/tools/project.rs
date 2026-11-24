@@ -1682,9 +1682,9 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
         if current == content_to_write {
             return format!("'{path}' already has this exact content; nothing to write.");
         }
-        // Auto-approve project writes if the policy grants it (they're sandboxed to
-        // the project and recoverable via git); otherwise ask, as before.
-        if !self.permissions.auto_project_writes() {
+        // Auto-approve project writes in Standard and Turbo modes (sandboxed to the
+        // project folder and backed by session snapshots); prompt in Supervised mode.
+        if self.permissions.active_mode() == crate::permissions::ExecutionMode::Supervised {
             let diff = unified_diff(&current, &content_to_write);
             let id = self.approvals.next_id();
             let rx = self.approvals.register(id);
@@ -1844,7 +1844,7 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
         } else {
             None
         };
-        if !self.permissions.auto_project_writes() {
+        if self.permissions.active_mode() == crate::permissions::ExecutionMode::Supervised {
             let diff = unified_diff(&current, &updated);
             let id = self.approvals.next_id();
             let rx = self.approvals.register(id);
@@ -1889,9 +1889,9 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
         }
     }
 
-    /// `project_delete` — remove a project file. ALWAYS approval-gated (never
-    /// auto-approved, unlike writes): a delete is irreversible here — these
-    /// projects have no version control — so the user confirms every one.
+    /// `project_delete` — remove a project file. Approval-gated in `Supervised` and
+    /// `Standard` modes; auto-approved in `Turbo` mode (still backed by `guard_snapshot`
+    /// so deleted files remain restorable via `restore_file`).
     pub(crate) async fn project_delete(
         &self,
         arguments: &str,
@@ -1920,34 +1920,35 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
         if !full.is_file() {
             return format!("error: '{path}' doesn't exist — nothing to delete.");
         }
-        let (lines, bytes) = std::fs::read(&full)
-            .map(|b| (String::from_utf8_lossy(&b).lines().count(), b.len()))
-            .unwrap_or((0, 0));
-        // Always ask — a delete can't be undone here.
-        let id = self.approvals.next_id();
-        let rx = self.approvals.register(id);
-        if on_event
-            .send(StreamEvent::ToolApproval {
-                id,
-                tool: "project_delete".into(),
-                path: path.to_string(),
-                diff: format!("Delete: {path}\n({lines} lines, {bytes} bytes)"),
-                warning: Some(
-                    "Deletes this file — Outpost's session snapshots can restore it via project_restore if needed."
-                        .into(),
-                ),
-                command: None,
-            })
-            .is_err()
-        {
-            return format!("could not request approval to delete '{path}' (UI channel closed)");
-        }
-        let decision = rx.await.unwrap_or_default();
-        if decision != "approve" {
-            return rejection_response(
-                &decision,
-                &format!("The user rejected deleting '{path}'. Nothing was removed."),
-            );
+        if self.permissions.active_mode() != crate::permissions::ExecutionMode::Turbo {
+            let (lines, bytes) = std::fs::read(&full)
+                .map(|b| (String::from_utf8_lossy(&b).lines().count(), b.len()))
+                .unwrap_or((0, 0));
+            let id = self.approvals.next_id();
+            let rx = self.approvals.register(id);
+            if on_event
+                .send(StreamEvent::ToolApproval {
+                    id,
+                    tool: "project_delete".into(),
+                    path: path.to_string(),
+                    diff: format!("Delete: {path}\n({lines} lines, {bytes} bytes)"),
+                    warning: Some(
+                        "Deletes this file — Outpost's session snapshots can restore it via project_restore if needed."
+                            .into(),
+                    ),
+                    command: None,
+                })
+                .is_err()
+            {
+                return format!("could not request approval to delete '{path}' (UI channel closed)");
+            }
+            let decision = rx.await.unwrap_or_default();
+            if decision != "approve" {
+                return rejection_response(
+                    &decision,
+                    &format!("The user rejected deleting '{path}'. Nothing was removed."),
+                );
+            }
         }
         if let Some(refusal) = self.guard_snapshot(&full, &format!("delete '{path}'")) {
             return refusal;
@@ -1959,8 +1960,8 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
     }
 
     /// `project_rename` — move/rename a project file. Both paths are sandboxed to
-    /// the project root; refuses to overwrite an existing destination. ALWAYS
-    /// approval-gated (it can break references and moves a file mid-work).
+    /// the project root; refuses to overwrite an existing destination. Approval-gated
+    /// in `Supervised` and `Standard` modes; auto-approved in `Turbo` mode.
     pub(crate) async fn project_rename(
         &self,
         arguments: &str,
@@ -2005,31 +2006,32 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
                 "error: '{to}' already exists — rename won't overwrite it. Pick a new name or delete the destination first."
             );
         }
-        // Always ask — a rename can break imports and moves a file mid-work.
-        let id = self.approvals.next_id();
-        let rx = self.approvals.register(id);
-        if on_event
-            .send(StreamEvent::ToolApproval {
-                id,
-                tool: "project_rename".into(),
-                path: format!("{from} → {to}"),
-                diff: format!("Rename:\n  {from}\n→ {to}"),
-                warning: Some(
-                    "References to the old path (imports, etc.) aren't updated automatically."
-                        .into(),
-                ),
-                command: None,
-            })
-            .is_err()
-        {
-            return format!("could not request approval to rename '{from}' (UI channel closed)");
-        }
-        let decision = rx.await.unwrap_or_default();
-        if decision != "approve" {
-            return rejection_response(
-                &decision,
-                &format!("The user rejected renaming '{from}'. Nothing was moved."),
-            );
+        if self.permissions.active_mode() != crate::permissions::ExecutionMode::Turbo {
+            let id = self.approvals.next_id();
+            let rx = self.approvals.register(id);
+            if on_event
+                .send(StreamEvent::ToolApproval {
+                    id,
+                    tool: "project_rename".into(),
+                    path: format!("{from} → {to}"),
+                    diff: format!("Rename:\n  {from}\n→ {to}"),
+                    warning: Some(
+                        "References to the old path (imports, etc.) aren't updated automatically."
+                            .into(),
+                    ),
+                    command: None,
+                })
+                .is_err()
+            {
+                return format!("could not request approval to rename '{from}' (UI channel closed)");
+            }
+            let decision = rx.await.unwrap_or_default();
+            if decision != "approve" {
+                return rejection_response(
+                    &decision,
+                    &format!("The user rejected renaming '{from}'. Nothing was moved."),
+                );
+            }
         }
         if let Some(parent) = to_full.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -2068,6 +2070,11 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
             .and_then(|v| arg_str(v, PATH_ALIASES).map(str::to_string))
             .filter(|p| !p.trim().is_empty());
 
+        let is_turbo = self.permissions.active_mode() == crate::permissions::ExecutionMode::Turbo;
+        if is_turbo && (path.is_none() || path.as_deref() == Some("all")) {
+            return "error: Restoring all session files at once ('restore_file' without a specific file path) is restricted in Turbo mode. Pass a specific relative file 'path' to revert individual files.".into();
+        }
+
         // Resolve the target set: one file, or everything captured under this root.
         let targets: Vec<PathBuf> = match &path {
             Some(p) if p != "all" => match Self::project_path(root, p) {
@@ -2093,33 +2100,37 @@ verify those by running the real tool yourself via run_command, e.g. `cargo chec
             })
             .collect();
 
-        // Approve the revert — it throws away the current content of these files.
-        let id = self.approvals.next_id();
-        let rx = self.approvals.register(id);
-        let preview = format!(
-            "Revert {} file(s) to their pre-session state:\n{}",
-            rels.len(),
-            rels.join("\n")
-        );
-        if on_event
-            .send(StreamEvent::ToolApproval {
-                id,
-                tool: "project_restore".into(),
-                path: root.display().to_string(),
-                diff: preview,
-                warning: Some("This discards the changes made to these files this session.".into()),
-                command: None,
-            })
-            .is_err()
-        {
-            return "could not request approval to restore (UI channel closed)".into();
-        }
-        let decision = rx.await.unwrap_or_default();
-        if decision != "approve" {
-            return rejection_response(
-                &decision,
-                "The user declined the restore. Nothing was changed.",
+        if !is_turbo {
+            // Approve the revert — it throws away the current content of these files.
+            let id = self.approvals.next_id();
+            let rx = self.approvals.register(id);
+            let preview = format!(
+                "Revert {} file(s) to their pre-session state:\n{}",
+                rels.len(),
+                rels.join("\n")
             );
+            if on_event
+                .send(StreamEvent::ToolApproval {
+                    id,
+                    tool: "project_restore".into(),
+                    path: root.display().to_string(),
+                    diff: preview,
+                    warning: Some(
+                        "This discards the changes made to these files this session.".into(),
+                    ),
+                    command: None,
+                })
+                .is_err()
+            {
+                return "could not request approval to restore (UI channel closed)".into();
+            }
+            let decision = rx.await.unwrap_or_default();
+            if decision != "approve" {
+                return rejection_response(
+                    &decision,
+                    "The user declined the restore. Nothing was changed.",
+                );
+            }
         }
 
         let mut msgs = Vec::new();

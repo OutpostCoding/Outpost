@@ -10,7 +10,7 @@
 // component module both need. Keeping them here means App.tsx is just the App
 // component and its handlers.
 
-import type { Message, Segment } from "./lib/provider";
+import type { ExecutionMode, Message, Segment } from "./lib/provider";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -258,6 +258,7 @@ export type ThreadTools = {
   temperature: number;
   topP: number;
   maxTokens: string;
+  executionMode?: ExecutionMode;
 };
 
 export const CHAT_TOOLS_DEFAULT: ThreadTools = {
